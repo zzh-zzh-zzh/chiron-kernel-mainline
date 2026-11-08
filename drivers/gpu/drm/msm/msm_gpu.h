@@ -137,6 +137,8 @@ struct msm_gpu_devfreq {
 	 * it is inactive.
 	 */
 	unsigned long idle_freq;
+	/** @nominal_freq: Last requested OPP for the core-clock path. */
+	unsigned long nominal_freq;
 	/**
 	 * @boost_freq:
 	 * A PM QoS constraint to boost min freq for a period of time

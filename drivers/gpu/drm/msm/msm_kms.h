@@ -9,6 +9,7 @@
 #define __MSM_KMS_H__
 
 #include <linux/clk.h>
+#include <linux/pm_qos.h>
 #include <linux/regulator/consumer.h>
 
 #include "msm_drv.h"
@@ -170,7 +171,14 @@ struct msm_kms {
 
 	struct workqueue_struct *wq;
 	struct msm_drm_thread event_thread[MAX_CRTCS];
+
+	/* Keep CPU/cluster wake latency bounded while a CRTC is active. */
+	struct pm_qos_request cpu_latency_qos;
+	atomic_t active_crtc_count;
 };
+
+void msm_kms_cpu_latency_hold(struct msm_kms *kms);
+void msm_kms_cpu_latency_release(struct msm_kms *kms);
 
 static inline int msm_kms_init(struct msm_kms *kms,
 		const struct msm_kms_funcs *funcs)
@@ -193,6 +201,8 @@ static inline int msm_kms_init(struct msm_kms *kms,
 		}
 	}
 
+	atomic_set(&kms->active_crtc_count, 0);
+	cpu_latency_qos_add_request(&kms->cpu_latency_qos, PM_QOS_DEFAULT_VALUE);
 	return 0;
 }
 
@@ -200,6 +210,7 @@ static inline void msm_kms_destroy(struct msm_kms *kms)
 {
 	unsigned i;
 
+	cpu_latency_qos_remove_request(&kms->cpu_latency_qos);
 	for (i = 0; i < ARRAY_SIZE(kms->pending_timers); i++)
 		msm_atomic_destroy_pending_timer(&kms->pending_timers[i]);
 

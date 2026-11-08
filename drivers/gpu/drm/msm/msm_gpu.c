@@ -58,8 +58,14 @@ static int disable_pwrrail(struct msm_gpu *gpu)
 
 static int enable_clk(struct msm_gpu *gpu)
 {
-	if (gpu->core_clk && gpu->fast_rate)
-		dev_pm_opp_set_rate(&gpu->pdev->dev, gpu->fast_rate);
+	int ret;
+
+	if (gpu->core_clk && gpu->fast_rate) {
+		ret = dev_pm_opp_set_rate(&gpu->pdev->dev, gpu->fast_rate);
+		if (ret)
+			return ret;
+		WRITE_ONCE(gpu->devfreq.nominal_freq, gpu->fast_rate);
+	}
 
 	/* Set the RBBM timer rate to 19.2Mhz */
 	if (gpu->rbbmtimer_clk)

@@ -22,6 +22,7 @@ static int msm_devfreq_target(struct device *dev, unsigned long *freq,
 	struct msm_gpu *gpu = dev_to_gpu(dev);
 	struct msm_gpu_devfreq *df = &gpu->devfreq;
 	struct dev_pm_opp *opp;
+	int ret = 0;
 
 	/*
 	 * Note that devfreq_recommended_opp() can modify the freq
@@ -48,12 +49,14 @@ static int msm_devfreq_target(struct device *dev, unsigned long *freq,
 		gpu->funcs->gpu_set_freq(gpu, opp, df->suspended);
 		mutex_unlock(&df->lock);
 	} else {
-		dev_pm_opp_set_rate(dev, *freq);
+		ret = dev_pm_opp_set_rate(dev, *freq);
+		if (!ret)
+			WRITE_ONCE(df->nominal_freq, *freq);
 	}
 
 	dev_pm_opp_put(opp);
 
-	return 0;
+	return ret;
 }
 
 static unsigned long get_freq(struct msm_gpu *gpu)
@@ -71,7 +74,12 @@ static unsigned long get_freq(struct msm_gpu *gpu)
 	if (gpu->funcs->gpu_get_freq)
 		return gpu->funcs->gpu_get_freq(gpu);
 
-	return clk_get_rate(gpu->core_clk);
+	/*
+	 * Devfreq statistics require an exact OPP, not the rounded PLL
+	 * rate or the 27 MHz parking rate used during runtime suspend.
+	 * Keep reporting the requested OPP, as the idle shadow does.
+	 */
+	return READ_ONCE(df->nominal_freq);
 }
 
 static int msm_devfreq_get_dev_status(struct device *dev,
@@ -165,6 +173,7 @@ void msm_devfreq_init(struct msm_gpu *gpu)
 		return;
 	}
 
+	WRITE_ONCE(df->nominal_freq, gpu->fast_rate);
 	msm_devfreq_profile.initial_freq = gpu->fast_rate;
 
 	/*

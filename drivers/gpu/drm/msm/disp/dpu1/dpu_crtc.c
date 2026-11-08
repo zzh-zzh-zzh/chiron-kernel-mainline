@@ -1197,6 +1197,8 @@ static void dpu_crtc_disable(struct drm_crtc *crtc,
 	struct drm_encoder *encoder;
 	unsigned long flags;
 	bool release_bandwidth = false;
+	bool was_enabled = dpu_crtc->enabled;
+	struct msm_kms *kms = &_dpu_crtc_get_kms(crtc)->base;
 
 	DRM_DEBUG_KMS("crtc%d\n", crtc->base.id);
 
@@ -1264,6 +1266,8 @@ static void dpu_crtc_disable(struct drm_crtc *crtc,
 	}
 
 	pm_runtime_put_sync(crtc->dev->dev);
+	if (was_enabled)
+		msm_kms_cpu_latency_release(kms);
 }
 
 static void dpu_crtc_enable(struct drm_crtc *crtc,
@@ -1272,10 +1276,14 @@ static void dpu_crtc_enable(struct drm_crtc *crtc,
 	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
 	struct drm_encoder *encoder;
 	bool request_bandwidth = false;
+	bool was_enabled = dpu_crtc->enabled;
 	struct drm_crtc_state *old_crtc_state;
+	struct msm_kms *kms = &_dpu_crtc_get_kms(crtc)->base;
 
 	old_crtc_state = drm_atomic_get_old_crtc_state(state, crtc);
 
+	if (!was_enabled)
+		msm_kms_cpu_latency_hold(kms);
 	pm_runtime_get_sync(crtc->dev->dev);
 
 	DRM_DEBUG_KMS("crtc%d\n", crtc->base.id);

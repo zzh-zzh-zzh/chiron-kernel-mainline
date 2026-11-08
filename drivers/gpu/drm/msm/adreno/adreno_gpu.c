@@ -12,6 +12,8 @@
 #include <linux/kernel.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/pm_opp.h>
+#include <linux/mfd/syscon.h>
+#include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/soc/qcom/mdt_loader.h>
 #include <linux/nvmem-consumer.h>
@@ -675,6 +677,12 @@ int adreno_hw_init(struct msm_gpu *gpu)
 		ring->cur = ring->start;
 		ring->next = ring->start;
 		ring->memptrs->rptr = 0;
+
+		/*
+		 * The hardware context is lost across reinitialization. Force
+		 * the next submit to restore its pagetable and context buffers.
+		 */
+		ring->cur_ctx_seqno = 0;
 		ring->memptrs->bv_fence = ring->fctx->completed_fence;
 
 		/* Detect and clean up an impossible fence, ie. if GPU managed
@@ -1182,6 +1190,55 @@ int adreno_read_speedbin(struct device *dev, u32 *speedbin)
 	return nvmem_cell_read_variable_le_u32(dev, "speed_bin", speedbin);
 }
 
+/*
+ * MSM8998 GX open-loop fallback. The board supplies stock ceiling voltages.
+ * OPP core orders voltage before clock on an increase and clock before voltage
+ * on a decrease. Stock MMSS CPR selects the low memory-access corner before
+ * lowering VDD, and the high corner after raising VDD. Preserve all other bits.
+ * This is not closed-loop CPR or a replacement for fuse-based calibration.
+ */
+static int adreno_msm8998_config_gx(struct device *dev,
+		struct dev_pm_opp *old_opp, struct dev_pm_opp *new_opp,
+		struct regulator **regulators, unsigned int count)
+{
+	struct regmap *mem_acc;
+	unsigned long voltage = dev_pm_opp_get_voltage(new_opp);
+	unsigned long rate = dev_pm_opp_get_freq(new_opp);
+	unsigned int selection = rate <= 342000000 ? BIT(0) : 0;
+	int old_voltage, ret;
+
+	if (count != 1 || IS_ERR(regulators[0]) ||
+	    voltage < 516000 || voltage > 1088000)
+		return -EINVAL;
+
+	mem_acc = syscon_regmap_lookup_by_phandle(dev->of_node, "qcom,gfx-mem-acc");
+	if (IS_ERR(mem_acc))
+		return PTR_ERR(mem_acc);
+
+	/* Read the rail, rather than assuming the cached OPP survived a reset. */
+	old_voltage = regulator_get_voltage(regulators[0]);
+	if (old_voltage < 0)
+		return old_voltage;
+
+	/* The low-voltage memory timing must be in place before VDD falls. */
+	if (voltage < (unsigned long)old_voltage) {
+		ret = regmap_update_bits(mem_acc, 0, BIT(0), selection);
+		if (ret)
+			return ret;
+	}
+
+	/* PM8005 S1 remains always-on for the independently powered GPU SMMU. */
+	ret = regulator_set_voltage(regulators[0], voltage, voltage);
+	if (ret)
+		return ret;
+
+	/* Do not select the faster memory timing until VDD has risen. */
+	if (voltage >= (unsigned long)old_voltage)
+		return regmap_update_bits(mem_acc, 0, BIT(0), selection);
+
+	return 0;
+}
+
 int adreno_gpu_init(struct drm_device *drm, struct platform_device *pdev,
 		struct adreno_gpu *adreno_gpu,
 		const struct adreno_gpu_funcs *funcs, int nr_rings)
@@ -1217,6 +1274,23 @@ int adreno_gpu_init(struct drm_device *drm, struct platform_device *pdev,
 			devm_pm_opp_set_clkname(dev, "core_clk");
 		} else
 			devm_pm_opp_set_clkname(dev, "core");
+	}
+
+	if (of_find_property(dev->of_node, "qcom,gfx-mem-acc", NULL)) {
+		const char * const supplies[] = { "vdd", NULL };
+		struct dev_pm_opp_config gx_config = {
+			.regulator_names = supplies,
+			.config_regulators = adreno_msm8998_config_gx,
+		};
+		struct regmap *mem_acc;
+
+		mem_acc = syscon_regmap_lookup_by_phandle(dev->of_node,
+						 "qcom,gfx-mem-acc");
+		if (IS_ERR(mem_acc))
+			return dev_err_probe(dev, PTR_ERR(mem_acc), "GX mem-acc unavailable\n");
+		ret = devm_pm_opp_set_config(dev, &gx_config);
+		if (ret < 0)
+			return dev_err_probe(dev, ret, "GX OPP supply unavailable\n");
 	}
 
 	gpu_name = devm_kasprintf(dev, GFP_KERNEL, "%"ADRENO_CHIPID_FMT,

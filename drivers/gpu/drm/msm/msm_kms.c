@@ -31,6 +31,22 @@ static const struct drm_mode_config_helper_funcs mode_config_helper_funcs = {
 	.atomic_commit_tail = msm_atomic_commit_tail,
 };
 
+#define MSM_ACTIVE_CRTC_CPU_LATENCY_US	1000
+
+void msm_kms_cpu_latency_hold(struct msm_kms *kms)
+{
+	if (atomic_inc_return(&kms->active_crtc_count) == 1)
+		cpu_latency_qos_update_request(&kms->cpu_latency_qos,
+					       MSM_ACTIVE_CRTC_CPU_LATENCY_US);
+}
+
+void msm_kms_cpu_latency_release(struct msm_kms *kms)
+{
+	if (atomic_dec_and_test(&kms->active_crtc_count))
+		cpu_latency_qos_update_request(&kms->cpu_latency_qos,
+					       PM_QOS_DEFAULT_VALUE);
+}
+
 static irqreturn_t msm_irq(int irq, void *arg)
 {
 	struct drm_device *dev = arg;

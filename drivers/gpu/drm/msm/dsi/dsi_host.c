@@ -32,8 +32,6 @@
 #include "msm_gem.h"
 #include "phy/dsi_phy.h"
 
-#define DSI_RESET_TOGGLE_DELAY_MS 20
-
 static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc_config *dsc);
 
 static int dsi_get_version(const void __iomem *base, u32 *major, u32 *minor)
@@ -166,6 +164,7 @@ struct msm_dsi_host {
 
 	struct drm_display_mode *mode;
 	struct drm_dsc_config *dsc;
+	unsigned long vid_done_timeout;
 
 	/* connected device info */
 	unsigned int channel;
@@ -402,6 +401,18 @@ int dsi_link_clk_set_rate_6g(struct msm_dsi_host *msm_host)
 				  msm_host->byte_clk_rate);
 	if (ret) {
 		pr_err("%s: dev_pm_opp_set_rate failed %d\n", __func__, ret);
+		return ret;
+	}
+
+	/*
+	 * The byte and pixel clocks share a PLL. Programming the pixel clock
+	 * can change the byte clock behind the OPP core's cached rate. Keep
+	 * the OPP power vote, but synchronize the byte clock before choosing
+	 * the pixel divider even when the requested OPP has not changed.
+	 */
+	ret = clk_set_rate(msm_host->byte_clk, msm_host->byte_clk_rate);
+	if (ret) {
+		pr_err("%s: Failed to synchronize byte clk, %d\n", __func__, ret);
 		return ret;
 	}
 
@@ -1158,7 +1169,7 @@ static void dsi_sw_reset(struct msm_dsi_host *msm_host)
 
 	/* dsi controller can only be reset while clocks are running */
 	dsi_write(msm_host, REG_DSI_RESET, 1);
-	msleep(DSI_RESET_TOGGLE_DELAY_MS); /* make sure reset happen */
+	udelay(5); /* make sure reset happen */
 	dsi_write(msm_host, REG_DSI_RESET, 0);
 	wmb(); /* controller out of reset */
 
@@ -1212,17 +1223,19 @@ static void dsi_wait4video_done(struct msm_dsi_host *msm_host)
 	u32 ret = 0;
 	struct device *dev = &msm_host->pdev->dev;
 
-	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_VIDEO_DONE, 1);
-
 	reinit_completion(&msm_host->video_comp);
 
-	ret = wait_for_completion_timeout(&msm_host->video_comp,
-			msecs_to_jiffies(70));
+	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_VIDEO_DONE, 1);
 
-	if (ret == 0)
-		DRM_DEV_ERROR(dev, "wait for video done timed out\n");
+	ret = wait_for_completion_timeout(&msm_host->video_comp,
+			msm_host->vid_done_timeout);
 
 	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_VIDEO_DONE, 0);
+
+	if (ret == 0) {
+		DRM_DEV_DEBUG(dev, "wait for video done timed out, resetting dsi\n");
+		dsi_sw_reset(msm_host);
+	}
 }
 
 static void dsi_wait4video_eng_busy(struct msm_dsi_host *msm_host)
@@ -2018,6 +2031,7 @@ int msm_dsi_host_init(struct msm_dsi *msm_dsi)
 	if (!msm_host)
 		return -ENOMEM;
 
+	msm_host->vid_done_timeout = msecs_to_jiffies(50);
 	msm_host->pdev = pdev;
 	msm_dsi->host = &msm_host->base;
 
@@ -2589,6 +2603,7 @@ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
 				  const struct drm_display_mode *mode)
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	u64 timeout_us;
 
 	if (msm_host->mode) {
 		drm_mode_destroy(msm_host->dev, msm_host->mode);
@@ -2599,6 +2614,13 @@ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
 	if (!msm_host->mode) {
 		pr_err("%s: cannot duplicate mode\n", __func__);
 		return -ENOMEM;
+	}
+
+	/* Pixel clock is in kHz. Allow three complete frames. */
+	if (mode->clock > 0 && mode->htotal > 0 && mode->vtotal > 0) {
+		timeout_us = DIV_ROUND_UP_ULL((u64)mode->htotal * mode->vtotal *
+					    USEC_PER_MSEC * 3, mode->clock);
+		msm_host->vid_done_timeout = usecs_to_jiffies(timeout_us);
 	}
 
 	return 0;

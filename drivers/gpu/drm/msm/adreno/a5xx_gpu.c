@@ -124,6 +124,57 @@ static void a5xx_submit_in_rb(struct msm_gpu *gpu, struct msm_gem_submit *submit
 	msm_gpu_retire(gpu);
 }
 
+static void a5xx_set_pagetable(struct a5xx_gpu *a5xx_gpu,
+		struct msm_ringbuffer *ring, struct msm_gem_submit *submit)
+{
+	struct msm_context *ctx = submit->queue->ctx;
+	struct drm_gpuvm *vm = msm_context_vm(submit->dev, ctx);
+	phys_addr_t ttbr;
+	u32 asid;
+	u64 memptr = rbmemptr(ring, ttbr0);
+
+	if (ctx->seqno == ring->cur_ctx_seqno)
+		return;
+
+	if (msm_iommu_pagetable_params(to_msm_vm(vm)->mmu, &ttbr, &asid))
+		return;
+
+	/* A5xx requires prior memory accesses to drain before changing TTBR0. */
+	OUT_PKT7(ring, CP_WAIT_FOR_IDLE, 0);
+	OUT_PKT7(ring, CP_WAIT_FOR_ME, 0);
+
+	/* Execute the table update */
+	OUT_PKT7(ring, CP_SMMU_TABLE_UPDATE, 3);
+	OUT_RING(ring, CP_SMMU_TABLE_UPDATE_0_TTBR0_LO(lower_32_bits(ttbr)));
+
+	OUT_RING(ring,
+		CP_SMMU_TABLE_UPDATE_1_TTBR0_HI(upper_32_bits(ttbr)) |
+		CP_SMMU_TABLE_UPDATE_1_ASID(asid));
+	OUT_RING(ring, CP_SMMU_TABLE_UPDATE_2_CONTEXTIDR(0));
+
+	/*
+	 * Write the new TTBR0 to the memstore. This is good for debugging.
+	 */
+	OUT_PKT7(ring, CP_MEM_WRITE, 5);
+	OUT_RING(ring, A5XX_CP_MEM_WRITE_ADDR_LO(lower_32_bits(memptr)));
+	OUT_RING(ring, A5XX_CP_MEM_WRITE_ADDR_HI(upper_32_bits(memptr)));
+	OUT_RING(ring, lower_32_bits(ttbr));
+	OUT_RING(ring, upper_32_bits(ttbr));
+	OUT_RING(ring, ctx->seqno);
+
+	/* Match the A5xx KGSL page-table switch serialization. */
+	OUT_PKT7(ring, CP_WAIT_FOR_ME, 0);
+	OUT_PKT7(ring, CP_WAIT_FOR_IDLE, 0);
+
+	/*
+	 * And finally, trigger a uche flush to be sure there isn't anything
+	 * lingering in that part of the GPU
+	 */
+
+	OUT_PKT7(ring, CP_EVENT_WRITE, 1);
+	OUT_RING(ring, 0x31);
+}
+
 static void a5xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 {
 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
@@ -161,11 +212,13 @@ static void a5xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 	 * to restore rendering state or do various flushes on switch.
 	 */
 	OUT_PKT7(ring, CP_PREEMPT_ENABLE_LOCAL, 1);
-	OUT_RING(ring, 0x0);
+	OUT_RING(ring, 0x00);
 
 	/* Allow CP_CONTEXT_SWITCH_YIELD packets in the IB2 */
 	OUT_PKT7(ring, CP_YIELD_ENABLE, 1);
 	OUT_RING(ring, 0x02);
+
+	a5xx_set_pagetable(a5xx_gpu, ring, submit);
 
 	/* Submit the commands */
 	for (i = 0; i < submit->nr_cmds; i++) {
@@ -1409,10 +1462,16 @@ static int a5xx_pm_suspend(struct msm_gpu *gpu)
 
 	/* Clear the VBIF pipe before shutting down */
 	gpu_write(gpu, REG_A5XX_VBIF_XIN_HALT_CTRL0, mask);
-	spin_until((gpu_read(gpu, REG_A5XX_VBIF_XIN_HALT_CTRL1) &
+	ret = spin_until((gpu_read(gpu, REG_A5XX_VBIF_XIN_HALT_CTRL1) &
 				mask) == mask);
 
 	gpu_write(gpu, REG_A5XX_VBIF_XIN_HALT_CTRL0, 0);
+	if (ret) {
+		/* Do not collapse power with outstanding bus traffic. */
+		dev_warn_ratelimited(&gpu->pdev->dev,
+				     "VBIF halt timed out; refusing GPU power collapse\n");
+		return -EBUSY;
+	}
 
 	/*
 	 * Reset the VBIF before power collapse to avoid issue with FIFO
@@ -1510,7 +1569,8 @@ static void a5xx_gpu_state_get_hlsq_regs(struct msm_gpu *gpu,
 		struct a5xx_gpu_state *a5xx_state)
 {
 	struct a5xx_crashdumper dumper = { 0 };
-	u32 offset, count = 0;
+	u64 offset;
+	u32 count = 0;
 	u64 *ptr;
 	int i;
 
@@ -1687,6 +1747,20 @@ static uint32_t a5xx_get_rptr(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
 	return ring->memptrs->rptr = gpu_read(gpu, REG_A5XX_CP_RB_RPTR);
 }
 
+static struct drm_gpuvm *
+a5xx_create_private_vm(struct msm_gpu *gpu, bool kernel_managed)
+{
+	struct msm_mmu *mmu;
+
+	mmu = msm_iommu_pagetable_create(to_msm_vm(gpu->vm)->mmu, kernel_managed);
+
+	if (IS_ERR(mmu))
+		return ERR_CAST(mmu);
+
+	return msm_gem_vm_create(gpu->dev, mmu, "gpu", 0x100000000ULL,
+					0x1ffffffffULL, kernel_managed);
+}
+
 static void check_speed_bin(struct device *dev)
 {
 	struct nvmem_cell *cell;
@@ -1746,7 +1820,8 @@ static struct msm_gpu *a5xx_gpu_init(struct drm_device *dev)
 
 	nr_rings = 4;
 
-	if (config->info->revn == 510)
+	/* A540 private TTBR0 requires a single ring until preemption restores it. */
+	if (config->info->revn == 510 || config->info->revn == 540)
 		nr_rings = 1;
 
 	ret = adreno_gpu_init(dev, pdev, adreno_gpu, config->info->funcs, nr_rings);
@@ -1799,6 +1874,7 @@ const struct adreno_gpu_funcs a5xx_gpu_funcs = {
 		.gpu_state_get = a5xx_gpu_state_get,
 		.gpu_state_put = a5xx_gpu_state_put,
 		.create_vm = adreno_create_vm,
+		.create_private_vm = a5xx_create_private_vm,
 		.get_rptr = a5xx_get_rptr,
 	},
 	.init = a5xx_gpu_init,

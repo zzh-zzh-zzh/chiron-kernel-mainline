@@ -309,6 +309,7 @@ static void msm_mdss_destroy(struct msm_mdss *msm_mdss)
 static int msm_mdss_reset(struct device *dev)
 {
 	struct reset_control *reset;
+	int ret;
 
 	reset = reset_control_get_optional_exclusive(dev, NULL);
 	if (!reset) {
@@ -319,17 +320,22 @@ static int msm_mdss_reset(struct device *dev)
 				     "failed to acquire mdss reset\n");
 	}
 
-	reset_control_assert(reset);
+	ret = reset_control_assert(reset);
+	if (ret)
+		goto out;
 	/*
 	 * Tests indicate that reset has to be held for some period of time,
 	 * make it one frame in a typical system
 	 */
 	msleep(20);
-	reset_control_deassert(reset);
+	ret = reset_control_deassert(reset);
+	if (!ret)
+		dev_info(dev, "MDSS hardware reset completed\n");
 
+out:
 	reset_control_put(reset);
 
-	return 0;
+	return ret;
 }
 
 /*

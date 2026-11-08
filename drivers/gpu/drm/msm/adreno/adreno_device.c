@@ -316,6 +316,7 @@ static int adreno_runtime_resume(struct device *dev)
 static int adreno_runtime_suspend(struct device *dev)
 {
 	struct msm_gpu *gpu = dev_to_gpu(dev);
+	int ret;
 
 	/*
 	 * We should be holding a runpm ref, which will prevent
@@ -326,7 +327,15 @@ static int adreno_runtime_suspend(struct device *dev)
 
 	msm_perfcntr_suspend(gpu);
 
-	return gpu->funcs->pm_suspend(gpu);
+	ret = gpu->funcs->pm_suspend(gpu);
+	if (ret == -EBUSY && to_adreno_gpu(gpu)->info->family == ADRENO_5XX) {
+		int restore_ret = msm_perfcntr_resume(gpu);
+
+		if (restore_ret)
+			dev_warn(dev, "Performance counter restore failed: %d\n",
+				 restore_ret);
+	}
+	return ret;
 }
 
 static void suspend_scheduler(struct msm_gpu *gpu)
