@@ -2448,7 +2448,13 @@ static int dwc3_gadget_wakeup(struct usb_gadget *g)
 	int			ret;
 
 	if (!dwc->wakeup_configured) {
-		dev_err(dwc->dev, "remote wakeup not configured\n");
+		/*
+		 * Remote wakeup is enabled by the USB host with
+		 * SET_FEATURE(DEVICE_REMOTE_WAKEUP). A host is allowed to
+		 * leave it disabled, so this is an expected capability check,
+		 * rather than a controller error.
+		 */
+		dev_dbg(dwc->dev, "remote wakeup not configured\n");
 		return -EINVAL;
 	}
 
@@ -2479,7 +2485,13 @@ static int dwc3_gadget_func_wakeup(struct usb_gadget *g, int intf_id)
 	int			link_state;
 
 	if (!dwc->wakeup_configured) {
-		dev_err(dwc->dev, "remote wakeup not configured\n");
+		/*
+		 * Remote wakeup is enabled by the USB host with
+		 * SET_FEATURE(DEVICE_REMOTE_WAKEUP). A host is allowed to
+		 * leave it disabled, so this is an expected capability check,
+		 * rather than a controller error.
+		 */
+		dev_dbg(dwc->dev, "remote wakeup not configured\n");
 		return -EINVAL;
 	}
 

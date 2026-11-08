@@ -229,3 +229,13 @@ config EXTCON_RTK_TYPE_C
 	  This driver will detect the status of the type-c port.
 
 endif
+
+config EXTCON_CHIRON_PMI8998_USB
+	tristate "MIX 2 PMI8998 USB2 cable detection"
+	depends on ARCH_QCOM && SPMI && REGMAP_SPMI && REGULATOR && EXTCON
+	depends on REGULATOR_QCOM_USB_VBUS
+	help
+	  Connect the PMI8998 hardware Type-C state machine to the Qualcomm
+	  legacy DWC3 glue and core using extcon. Source passive USB2 OTG
+	  adapters at 5 V / 500 mA; leave charging and fuel-gauge setup intact.
+
