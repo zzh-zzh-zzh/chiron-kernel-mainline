@@ -281,7 +281,7 @@
 			little_cpu_sleep_1: cpu-sleep-0-1 {
 				compatible = "arm,idle-state";
 				idle-state-name = "little-power-collapse";
-				/* CPU + L2 Power Collapse (C3, D4) */
+				/* CPU Power Collapse (C3); no explicit L2/system state */
 				arm,psci-suspend-param = <0x40000003>;
 				entry-latency-us = <814>;
 				exit-latency-us = <4562>;
@@ -302,7 +302,7 @@
 			big_cpu_sleep_1: cpu-sleep-1-1 {
 				compatible = "arm,idle-state";
 				idle-state-name = "big-power-collapse";
-				/* CPU + L2 Power Collapse (C3, D4) */
+				/* CPU Power Collapse (C3); no explicit L2/system state */
 				arm,psci-suspend-param = <0x40000003>;
 				entry-latency-us = <724>;
 				exit-latency-us = <2027>;
@@ -1594,7 +1594,8 @@
 		};
 
 		adreno_smmu: iommu@5040000 {
-			compatible = "qcom,msm8998-smmu-v2", "qcom,smmu-v2";
+			compatible = "qcom,msm8998-smmu-v2", "qcom,smmu-v2",
+				     "qcom,adreno-smmu";
 			reg = <0x05040000 0x10000>;
 			clocks = <&gcc GCC_GPU_CFG_AHB_CLK>,
 				 <&gcc GCC_BIMC_GFX_CLK>,
@@ -3255,6 +3256,21 @@
 				<GIC_SPI 272 IRQ_TYPE_LEVEL_HIGH>;
 
 			power-domains = <&mmcc BIMC_SMMU_GDSC>;
+		};
+
+		imem@146bf000 {
+			compatible = "simple-mfd";
+			reg = <0x146bf000 0x1000>;
+
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			ranges = <0 0x146bf000 0x1000>;
+
+			pil-reloc@94c {
+				compatible = "qcom,pil-reloc-info";
+				reg = <0x94c 0xc8>;
+			};
 		};
 
 		remoteproc_adsp: remoteproc@17300000 {

@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* Read-only monitoring of the existing PMI8998 v2 fuel gauge. */
+&pmi8998_lsid0 {
+	battery@4000 {
+		compatible = "xiaomi,chiron-battery-monitor";
+		reg = <0x4000>;
+		io-channels = <&pmi8998_rradc 0>;
+		io-channel-names = "batt-id";
+	};
+};
+
+/* Preserve firmware battery/thermal calibration; manage charging with conservative thermal gating. */
+&pmi8998_charger {
+	compatible = "xiaomi,chiron-charger";
+	io-channels = <&pmi8998_rradc 3>, <&pmi8998_rradc 4>, <&pmi8998_rradc 8>;
+	io-channel-names = "usbin_i", "usbin_v", "charger_temp";
+	interrupts = <0x2 0x13 0x4 IRQ_TYPE_EDGE_BOTH>,
+		     <0x2 0x12 0x2 IRQ_TYPE_EDGE_BOTH>,
+		     <0x2 0x16 0x1 IRQ_TYPE_EDGE_RISING>,
+		     <0x2 0x13 0x6 IRQ_TYPE_EDGE_RISING>,
+		     <0x2 0x13 0x5 IRQ_TYPE_EDGE_RISING>;
+	interrupt-names = "usb-plugin", "bat-ov", "wdog-bark",
+			  "usbin-icl-change", "usbin-src-change";
+	status = "okay";
+};

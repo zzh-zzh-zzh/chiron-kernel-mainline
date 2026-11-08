@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* A540: stock v2.x bounds and conservative open-loop OPP voltages. */
+#include "pm8005.dtsi"
+
+&pm8005_regulators {
+	vdd_s1-supply = <&vph_pwr>;
+
+	pm8005_s1: s1 {
+		regulator-min-microvolt = <516000>;
+		regulator-max-microvolt = <1088000>;
+		regulator-enable-ramp-delay = <500>;
+		/* The GPU SMMU powers GX independently; keep the supply resident. */
+		regulator-boot-on;
+		regulator-always-on;
+	};
+};
+
+&adreno_smmu {
+	status = "okay";
+};
+
+&adreno_gpu {
+	status = "okay";
+	vdd-supply = <&pm8005_s1>;
+	qcom,gfx-mem-acc = <&chiron_gfx_mem_acc>;
+
+	zap-shader {
+		/* Stock ELF explicitly permits relocation; reuse the existing pool. */
+		memory-region = <&gpu_mem>;
+		firmware-name = "qcom/msm8998/xiaomi/chiron/a540_zap.mdt";
+	};
+
+};
+
+&soc {
+	chiron_gfx_mem_acc: syscon@1fcf004 {
+		compatible = "syscon";
+		reg = <0x01fcf004 0x4>;
+	};
+};
+
+/* Maximum ceiling across all eight stock fuse combinations; no undervolt. */
+&gpu_opp_table {
+	opp-257000000 {
+		opp-microvolt = <724000>;
+	};
+	opp-342000000 {
+		opp-microvolt = <772000>;
+	};
+	opp-414000000 {
+		opp-microvolt = <880000>;
+	};
+	opp-515000097 {
+		opp-microvolt = <916000>;
+	};
+	opp-596000097 {
+		opp-microvolt = <968000>;
+	};
+	opp-670000048 {
+		opp-microvolt = <1024000>;
+	};
+	opp-710000097 {
+		opp-microvolt = <1088000>;
+	};
+};

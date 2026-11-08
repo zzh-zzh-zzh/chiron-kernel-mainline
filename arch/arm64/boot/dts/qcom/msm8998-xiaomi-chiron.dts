@@ -1,0 +1,311 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Xiaomi Mi MIX 2 (chiron), base board resources.
+ * Based on msm8998-xiaomi-sagit.dts:
+ * Copyright (c) 2022, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022, Degdag Mohamed <degdagmohamed@gmail.com>
+ * Copyright (c) 2022, Dzmitry Sankouski <dsankouski@gmail.com>
+ *
+ * Board ID and fixed memory ranges checked against MIUI V12.0.1.0
+ * PDECNXM boot.img, board-id <32 0>. Feature overlays are added by
+ * the kernel recipe.
+ */
+
+/dts-v1/;
+
+#include "msm8998.dtsi"
+#include "pm8998.dtsi"
+#include "pmi8998.dtsi"
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/pinctrl/qcom,pmic-gpio.h>
+
+/delete-node/ &adsp_mem;
+/delete-node/ &mpss_mem;
+/delete-node/ &venus_mem;
+/delete-node/ &mba_mem;
+/delete-node/ &slpi_mem;
+/* Unused in this tree; the stock SLPI reservation covers these addresses. */
+/delete-node/ &ipa_fw_mem;
+/delete-node/ &ipa_gsi_mem;
+
+/ {
+	model = "Xiaomi Mi MIX 2";
+	compatible = "xiaomi,chiron", "qcom,msm8998";
+	chassis-type = "handset";
+	qcom,board-id = <32 0>;
+
+	aliases {
+		serial0 = &blsp2_uart1;
+		/* Keep UART3 from reusing ttyMSM0 when serdev probes WCN3990. */
+		serial1 = &blsp1_uart3;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	reserved-memory {
+		adsp_mem: memory@8b200000 {
+			reg = <0 0x8b200000 0 0x1e00000>;
+			no-map;
+		};
+
+		mpss_mem: memory@8d000000 {
+			reg = <0 0x8d000000 0 0x7000000>;
+			no-map;
+		};
+
+		venus_mem: memory@94000000 {
+			reg = <0 0x94000000 0 0x500000>;
+			no-map;
+		};
+
+		mba_mem: memory@94500000 {
+			reg = <0 0x94500000 0 0x200000>;
+			no-map;
+		};
+
+		slpi_mem: memory@94700000 {
+			reg = <0 0x94700000 0 0xf00000>;
+			no-map;
+		};
+
+		/* Reserve the bootloader framebuffer until display handover. */
+		cont_splash_mem: memory@9d600000 {
+			reg = <0 0x9d600000 0 0x2400000>;
+			no-map;
+		};
+
+		/*
+		 * 1 MiB persistent store for panic/oops dumps (I-2).  Mid-way up the
+		 * 544 MiB System RAM chunk that /proc/iomem reports as
+		 * 9fa00000-bfffbfff: far from the bootloader's low-memory images and
+		 * from the reserved block at the top of RAM.  (First attempt at
+		 * 9fa00000 -- right above cont_splash_mem -- never survived a reboot.)
+		 */
+		ramoops: ramoops@b0000000 {
+			compatible = "ramoops";
+			reg = <0 0xb0000000 0 0x100000>;
+			record-size = <0x00040000>;
+			console-size = <0x00040000>;
+			pmsg-size = <0x00040000>;
+			no-map;
+		};
+	};
+
+	vph_pwr: vph-pwr-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "vph_pwr";
+		regulator-min-microvolt = <3700000>;
+		regulator-max-microvolt = <3700000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+		pinctrl-names = "default";
+		pinctrl-0 = <&vol_up_key_default>;
+
+		key-volume-up {
+			label = "Volume Up";
+			gpios = <&pm8998_gpios 6 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_VOLUMEUP>;
+			debounce-interval = <15>;
+			wakeup-source;
+		};
+	};
+};
+
+&blsp2_uart1 {
+	status = "okay";
+};
+
+/* The inherited SMMU otherwise probes and powers GX despite a disabled GPU. */
+&adreno_smmu {
+	status = "disabled";
+};
+
+/* The reference SoC file carries sagit-specific supplies on disabled nodes. */
+&pcie_phy {
+	/delete-property/ vdda-phy-supply;
+	/delete-property/ vdda-pll-supply;
+};
+
+&remoteproc_slpi {
+	/delete-property/ px-supply;
+};
+
+&pm8998_gpios {
+	vol_up_key_default: vol-up-key-default-state {
+		pins = "gpio6";
+		function = "normal";
+		bias-pull-up;
+		input-enable;
+		qcom,drive-strength = <PMIC_GPIO_STRENGTH_NO>;
+	};
+};
+
+&pm8998_resin {
+	linux,code = <KEY_VOLUMEDOWN>;
+	status = "okay";
+};
+
+/* USB and UFS supply paths, checked against the downstream chiron board. */
+&rpm_requests {
+	regulators-0 {
+		compatible = "qcom,rpm-pm8998-regulators";
+		vdd_s3-supply = <&vph_pwr>;
+		vdd_s4-supply = <&vph_pwr>;
+		vdd_s5-supply = <&vph_pwr>;
+		vdd_s7-supply = <&vph_pwr>;
+		vdd_l1_l27-supply = <&vreg_s7a>;
+		vdd_l2_l8_l17-supply = <&vreg_s3a>;
+		vdd_l7_l12_l14_l15-supply = <&vreg_s5a>;
+		vdd_l20_l24-supply = <&vreg_bob>;
+		vdd_l26-supply = <&vreg_s3a>;
+
+		vreg_s3a: s3 {
+			regulator-min-microvolt = <1352000>;
+			regulator-max-microvolt = <1352000>;
+		};
+
+		vreg_s4a: s4 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-allow-set-load;
+		};
+
+		vreg_s5a: s5 {
+			regulator-min-microvolt = <1904000>;
+			regulator-max-microvolt = <2040000>;
+		};
+
+		vreg_s7a: s7 {
+			regulator-min-microvolt = <900000>;
+			regulator-max-microvolt = <1028000>;
+		};
+
+		vreg_l1a: l1 {
+			regulator-min-microvolt = <880000>;
+			regulator-max-microvolt = <880000>;
+		};
+
+		vreg_l12a: l12 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+		};
+
+		vreg_l2a: l2 {
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+		};
+
+		vreg_l20a: l20 {
+			regulator-min-microvolt = <2960000>;
+			regulator-max-microvolt = <2960000>;
+			regulator-allow-set-load;
+		};
+
+		vreg_l26a: l26 {
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+			regulator-allow-set-load;
+			/* Downstream keeps the UFS reference-clock rail enabled. */
+			regulator-always-on;
+		};
+
+		vreg_l24a: l24 {
+			regulator-min-microvolt = <3088000>;
+			regulator-max-microvolt = <3088000>;
+		};
+	};
+
+	regulators-1 {
+		compatible = "qcom,rpm-pmi8998-regulators";
+		vdd_bob-supply = <&vph_pwr>;
+
+		vreg_bob: bob {
+			regulator-min-microvolt = <3312000>;
+			regulator-max-microvolt = <3600000>;
+		};
+	};
+};
+
+&tlmm {
+	gpio-reserved-ranges = <0 4>, <81 4>;
+};
+
+&qusb2phy {
+	vdd-supply = <&vreg_l1a>;
+	vdda-pll-supply = <&vreg_l12a>;
+	vdda-phy-dpdm-supply = <&vreg_l24a>;
+	status = "okay";
+};
+
+&usb3 {
+	qcom,select-utmi-as-pipe-clk;
+	status = "okay";
+};
+
+&usb3_dwc3 {
+	phys = <&qusb2phy>;
+	phy-names = "usb2-phy";
+	maximum-speed = "high-speed";
+	dr_mode = "peripheral";
+};
+
+&ufshc {
+	/* The controller's GDSC is already described by power-domains. */
+	vcc-supply = <&vreg_l20a>;
+	vccq-supply = <&vreg_l26a>;
+	vccq2-supply = <&vreg_s4a>;
+	vcc-max-microamp = <750000>;
+	vccq-max-microamp = <560000>;
+	vccq2-max-microamp = <750000>;
+	status = "okay";
+};
+
+&ufsphy {
+	vdda-phy-supply = <&vreg_l1a>;
+	vdda-pll-supply = <&vreg_l2a>;
+	status = "okay";
+};
+
+/* Per-feature overlays below the base DTS select enabled peripherals. */
+
+#include "msm8998-xiaomi-chiron-display.dtsi"
+
+#include "msm8998-xiaomi-chiron-touch.dtsi"
+
+#include "msm8998-xiaomi-chiron-handover.dtsi"
+
+
+
+#include "msm8998-xiaomi-chiron-battery.dtsi"
+
+#include "msm8998-xiaomi-chiron-wifi.dtsi"
+
+/*
+ * Opt-in diagnostic channel: RPM master sleep counters (APSS/MPSS/ADSP/SLPI/TZ/SPSS).
+ * I-11: CONFIG_QCOM_RPM_MASTER_STATS=m was already built but nothing included this
+ * fragment, so the driver could never bind. Verified 2026-11-07.
+ */
+#include "msm8998-xiaomi-chiron-rpm-stats.dtsi"
+
+
+
+
+
+#include "msm8998-xiaomi-chiron-cpu.dtsi"
+
+#include "msm8998-xiaomi-chiron-usb.dtsi"
+
+
+
+/* Server: retain native KMS/fbcon without GPU or unused peripherals. */
+&adreno_gpu { status = "disabled"; };
+&adreno_smmu { status = "disabled"; };
+&remoteproc_adsp { status = "disabled"; };
+&lpass_q6_smmu { status = "disabled"; };
+&blsp1_uart3 { status = "disabled"; };

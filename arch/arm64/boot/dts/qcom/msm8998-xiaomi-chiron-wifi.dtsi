@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* WCN3990 supplies verified against chiron stock DTBs 00, 01 and 10.
+ * MSS auto_boot is false in qcom_q6v5_mss; firmware is staged in RAM later.
+ */
+&rpm_requests {
+	regulators-0 {
+		vdd_l4_l5-supply = <&vreg_s7a>;
+		vdd_l10_l23_l25-supply = <&vreg_bob>;
+
+		vreg_l5a: l5 {
+			regulator-min-microvolt = <800000>;
+			regulator-max-microvolt = <800000>;
+		};
+
+		vreg_l7a: l7 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+		};
+
+		vreg_l17a: l17 {
+			regulator-min-microvolt = <1304000>;
+			regulator-max-microvolt = <1304000>;
+		};
+
+		/* WCN3990 CH1 is PM8998 L23 on the reference MSM8998 boards. */
+		vreg_l23a: l23 {
+			regulator-min-microvolt = <3312000>;
+			regulator-max-microvolt = <3312000>;
+		};
+
+		vreg_l25a: l25 {
+			regulator-min-microvolt = <3104000>;
+			regulator-max-microvolt = <3312000>;
+		};
+	};
+};
+
+&wifi {
+	vdd-0.8-cx-mx-supply = <&vreg_l5a>;
+	vdd-1.8-xo-supply = <&vreg_l7a>;
+	vdd-1.3-rfa-supply = <&vreg_l17a>;
+	vdd-3.3-ch0-supply = <&vreg_l25a>;
+	vdd-3.3-ch1-supply = <&vreg_l23a>;
+	status = "okay";
+};
+
+&remoteproc_mss {
+	firmware-name = "qcom/msm8998/xiaomi/chiron/mba.mbn",
+			"qcom/msm8998/xiaomi/chiron/modem.mdt";
+	status = "okay";
+};

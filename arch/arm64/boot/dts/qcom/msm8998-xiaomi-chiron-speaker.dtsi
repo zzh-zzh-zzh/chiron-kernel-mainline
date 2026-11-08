@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* Original Chiron BLSP2 QUP4 and QUAT MI2S speaker wiring. */
+/ {
+	sound {
+		compatible = "xiaomi,chiron-tas2559-sndcard";
+		model = "Chiron Speakers";
+		widgets = "Speaker", "Speaker";
+		reg = <0 0x1711d000 0 4>;
+		reg-names = "lpaif-quat-mode-muxsel";
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&chiron_quat_active>;
+		pinctrl-1 = <&chiron_quat_sleep>;
+		audio-routing = "RX_BIAS", "MCLK", "Speaker", "OUT";
+		quat-playback-dai-link {
+			link-name = "Quaternary MI2S Playback";
+			cpu { sound-dai = <&chiron_q6afedai QUATERNARY_MI2S_RX>; };
+			platform { sound-dai = <&chiron_q6routing>; };
+			codec { sound-dai = <&chiron_tas>; };
+		};
+	};
+};
+
+&chiron_q6afedai {
+	dai@16 {
+		reg = <QUATERNARY_MI2S_RX>;
+		qcom,sd-lines = <0>;
+	};
+};
+
+&blsp2_i2c4 {
+	status = "okay";
+	clock-frequency = <400000>;
+	chiron_tas: amplifier@4c {
+		compatible = "xiaomi,chiron-tas2559";
+		reg = <0x4c>;
+		#sound-dai-cells = <0>;
+		reset-gpios = <&tlmm 41 GPIO_ACTIVE_LOW>;
+		irq-gpios = <&tlmm 42 GPIO_ACTIVE_HIGH>, <&tlmm 11 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&chiron_amp_reset &chiron_amp_irq>;
+	};
+};
+
+&tlmm {
+	chiron_amp_reset: speaker-reset-state {
+		pins = "gpio41";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+	chiron_amp_irq: speaker-irq-state {
+		pins = "gpio42", "gpio11";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		input-enable;
+	};
+	chiron_quat_active: speaker-mi2s-active-state {
+		pins = "gpio58", "gpio59", "gpio60";
+		function = "qua_mi2s";
+		drive-strength = <8>;
+		bias-disable;
+	};
+	chiron_quat_sleep: speaker-mi2s-sleep-state {
+		pins = "gpio58", "gpio59", "gpio60";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		input-enable;
+	};
+};

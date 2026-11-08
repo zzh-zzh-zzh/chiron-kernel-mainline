@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* WCN3990 uses BLSP1 UART3, as on Xiaomi sagit and OnePlus MSM8998 boards.
+ * The XO/RF/CH0 rails are shared with the already enabled WLAN block.
+ */
+&blsp1_uart3 {
+	status = "okay";
+
+	bluetooth {
+		compatible = "qcom,wcn3990-bt";
+		vddio-supply = <&vreg_s4a>;
+		vddxo-supply = <&vreg_l7a>;
+		vddrf-supply = <&vreg_l17a>;
+		vddch0-supply = <&vreg_l25a>;
+		max-speed = <3200000>;
+	};
+};
+
+&blsp1_uart3_on {
+	rx-pins {
+		/delete-property/ bias-disable;
+		bias-pull-up;
+	};
+	cts-pins {
+		/delete-property/ bias-disable;
+		bias-pull-down;
+	};
+};
+
+/* Permit the HCI driver's declared active load votes on shared rails. */
+&vreg_l7a { regulator-allow-set-load; };
+&vreg_l17a { regulator-allow-set-load; };
+&vreg_l25a { regulator-allow-set-load; };

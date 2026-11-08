@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: GPL-2.0
+
+/* MSM8998 master-stats v2: 80-byte records, 4 KiB apart. */
+&rpm_msg_ram {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	ranges = <0 0x00778000 0x7000>;
+
+	apss_master_stats: apss-sram@150 {
+		reg = <0x150 0x50>;
+	};
+
+	mpss_master_stats: mpss-sram@1150 {
+		reg = <0x1150 0x50>;
+	};
+
+	adsp_master_stats: adsp-sram@2150 {
+		reg = <0x2150 0x50>;
+	};
+
+	slpi_master_stats: slpi-sram@3150 {
+		reg = <0x3150 0x50>;
+	};
+
+	tz_master_stats: tz-sram@4150 {
+		reg = <0x4150 0x50>;
+	};
+
+	spss_master_stats: spss-sram@5150 {
+		reg = <0x5150 0x50>;
+	};
+};
+
+/ {
+	master-stats {
+		compatible = "qcom,rpm-master-stats";
+		qcom,rpm-msg-ram = <&apss_master_stats>,
+				   <&mpss_master_stats>,
+				   <&adsp_master_stats>,
+				   <&slpi_master_stats>,
+				   <&tz_master_stats>,
+				   <&spss_master_stats>;
+		qcom,master-names = "APSS", "MPSS", "ADSP", "SLPI", "TZ", "SPSS";
+	};
+};

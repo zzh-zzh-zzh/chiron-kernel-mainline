@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* Experimental display wiring, checked against chiron MIUI V12.0.1.0 DTB. */
+&rpm_requests {
+	regulators-0 {
+		vreg_l14a: l14 {
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-allow-set-load;
+		};
+	};
+};
+
+&vreg_l1a {
+	regulator-allow-set-load;
+};
+
+&vreg_l2a {
+	regulator-allow-set-load;
+};
+
+&lab {
+	regulator-min-microvolt = <5500000>;
+	regulator-max-microvolt = <5500000>;
+	regulator-soft-start;
+	regulator-pull-down;
+};
+
+&ibb {
+	regulator-min-microvolt = <5500000>;
+	regulator-max-microvolt = <5500000>;
+	regulator-soft-start;
+	regulator-pull-down;
+};
+
+&mdss {
+	status = "okay";
+};
+
+&mdss_dsi0 {
+	vdd-supply = <&vreg_l1a>;
+	vdda-supply = <&vreg_l2a>;
+	status = "okay";
+
+	panel@0 {
+		compatible = "xiaomi,chiron-jdi-nt35596s";
+		reg = <0>;
+		reset-gpios = <&tlmm 94 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&chiron_panel_reset>;
+		vddio-supply = <&vreg_l14a>;
+		vddpos-supply = <&lab>;
+		vddneg-supply = <&ibb>;
+		backlight = <&pmi8998_wled>;
+		port {
+			chiron_panel_in: endpoint {
+				remote-endpoint = <&mdss_dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	remote-endpoint = <&chiron_panel_in>;
+	data-lanes = <0 1 2 3>;
+};
+
+&mdss_dsi0_phy {
+	vdds-supply = <&vreg_l1a>;
+	status = "okay";
+};
+
+&pmi8998_wled {
+	qcom,current-limit-microamp = <20000>;
+	qcom,current-boost-limit = <970>;
+	qcom,ovp-millivolt = <19600>;
+	qcom,switching-freq = <600>;
+	qcom,enabled-strings = <0 1 2 3>;
+	qcom,external-pfet;
+	/* Moderate initial light level; brightness range is 0..4095. */
+	default-brightness = <512>;
+	status = "okay";
+};
+
+&tlmm {
+	chiron_panel_reset: chiron-panel-reset-state {
+		pins = "gpio94";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+	};
+};

@@ -1,0 +1,5 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* Stop the bootloader display before the native DRM driver attaches its IOMMU. */
+&mdss {
+	resets = <&mmcc MDSS_BCR>;
+};

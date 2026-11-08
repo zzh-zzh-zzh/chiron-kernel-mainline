@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* Chiron stock WCD9335 wiring; TAS2559/TAS2560 is not enabled here.
+ * ADSP firmware and audio modules belong on the persistent root filesystem.
+ */
+#include <dt-bindings/soc/qcom,apr.h>
+#include <dt-bindings/sound/qcom,q6afe.h>
+#include <dt-bindings/sound/qcom,q6asm.h>
+#include <dt-bindings/sound/qcom,wcd9335.h>
+
+/ {
+	chiron_audio_mclk: audio-mclk {
+		compatible = "gpio-gate-clock";
+		clocks = <&rpmcc RPM_SMD_DIV_CLK1>;
+		#clock-cells = <0>;
+		enable-gpios = <&pm8998_gpios 13 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&chiron_audio_mclk_pin>;
+	};
+
+	sound {
+		compatible = "xiaomi,chiron-wcd9335-sndcard";
+		model = "Chiron WCD9335";
+		audio-routing = "RX_BIAS", "MCLK";
+
+		mm1-dai-link {
+			link-name = "MultiMedia1";
+			cpu { sound-dai = <&chiron_q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>; };
+		};
+		slim-playback-dai-link {
+			link-name = "SLIM Playback";
+			cpu { sound-dai = <&chiron_q6afedai SLIMBUS_0_RX>; };
+			platform { sound-dai = <&chiron_q6routing>; };
+			codec { sound-dai = <&chiron_wcd9335 AIF1_PB>; };
+		};
+		slim-capture-dai-link {
+			link-name = "SLIM Capture";
+			cpu { sound-dai = <&chiron_q6afedai SLIMBUS_0_TX>; };
+			platform { sound-dai = <&chiron_q6routing>; };
+			codec { sound-dai = <&chiron_wcd9335 AIF1_CAP>; };
+		};
+	};
+};
+
+&soc {
+	chiron_slimbam: dma-controller@17184000 {
+		compatible = "qcom,bam-v1.7.0";
+		reg = <0x17184000 0x32000>;
+		interrupts = <GIC_SPI 164 IRQ_TYPE_LEVEL_HIGH>;
+		#dma-cells = <1>;
+		qcom,controlled-remotely;
+		num-channels = <31>;
+		qcom,ee = <1>;
+		qcom,num-ees = <2>;
+	};
+
+	slim-ngd@171c0000 {
+		compatible = "qcom,slim-ngd-v1.5.0";
+		reg = <0x171c0000 0x2c000>;
+		interrupts = <GIC_SPI 163 IRQ_TYPE_LEVEL_HIGH>;
+		dmas = <&chiron_slimbam 3>, <&chiron_slimbam 4>;
+		dma-names = "rx", "tx";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		slim@1 {
+			reg = <1>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			chiron_tasha_ifd: codec@0,0 {
+				compatible = "slim217,1a0";
+				reg = <0 0>;
+			};
+			chiron_wcd9335: codec@1,0 {
+				compatible = "slim217,1a0";
+				reg = <1 0>;
+				clocks = <&chiron_audio_mclk>, <&rpmcc RPM_SMD_LN_BB_CLK2>;
+				clock-names = "mclk", "slimbus";
+				interrupt-parent = <&tlmm>;
+				interrupts = <54 IRQ_TYPE_LEVEL_HIGH>;
+				interrupt-names = "intr1";
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&chiron_codec_reset &chiron_codec_irq>;
+				reset-gpios = <&tlmm 64 GPIO_ACTIVE_LOW>;
+				slim-ifc-dev = <&chiron_tasha_ifd>;
+				#sound-dai-cells = <1>;
+				vdd-buck-supply = <&vreg_s4a>;
+				vdd-buck-sido-supply = <&vreg_s4a>;
+				vdd-tx-supply = <&vreg_s4a>;
+				vdd-rx-supply = <&vreg_s4a>;
+				vdd-io-supply = <&vreg_s4a>;
+			};
+		};
+	};
+};
+
+&remoteproc_adsp {
+	status = "okay";
+	firmware-name = "qcom/chiron/adsp.mdt";
+	glink-edge {
+		apr {
+			compatible = "qcom,apr-v2";
+			qcom,glink-channels = "apr_audio_svc";
+			qcom,domain = <APR_DOMAIN_ADSP>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			service@3 {
+				compatible = "qcom,q6core";
+				reg = <APR_SVC_ADSP_CORE>;
+			};
+			service@4 {
+				compatible = "qcom,q6afe";
+				reg = <APR_SVC_AFE>;
+				chiron_q6afedai: dais {
+					compatible = "qcom,q6afe-dais";
+					#address-cells = <1>;
+					#size-cells = <0>;
+					#sound-dai-cells = <1>;
+				};
+			};
+			service@7 {
+				compatible = "qcom,q6asm";
+				reg = <APR_SVC_ASM>;
+				chiron_q6asmdai: dais {
+					compatible = "qcom,q6asm-dais";
+					#address-cells = <1>;
+					#size-cells = <0>;
+					#sound-dai-cells = <1>;
+					iommus = <&lpass_q6_smmu 1>;
+					dai@0 {
+						reg = <MSM_FRONTEND_DAI_MULTIMEDIA1>;
+					};
+				};
+			};
+			service@8 {
+				compatible = "qcom,q6adm";
+				reg = <APR_SVC_ADM>;
+				chiron_q6routing: routing {
+					compatible = "qcom,q6adm-routing";
+					#sound-dai-cells = <0>;
+				};
+			};
+		};
+	};
+};
+
+&lpass_q6_smmu { status = "okay"; };
+
+&pm8998_gpios {
+	chiron_audio_mclk_pin: audio-mclk-state {
+		pins = "gpio13";
+		function = "func2";
+		power-source = <0>; /* PM8998 low-voltage GPIO, as on sagit. */
+		bias-disable;
+	};
+};
+
+&tlmm {
+	chiron_codec_reset: codec-reset-state {
+		pins = "gpio64";
+		function = "gpio";
+		drive-strength = <16>;
+		bias-disable;
+	};
+	chiron_codec_irq: codec-irq-state {
+		pins = "gpio54";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		input-enable;
+	};
+};
