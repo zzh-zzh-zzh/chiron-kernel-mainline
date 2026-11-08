@@ -424,8 +424,8 @@ static int rradc_read_status_in_cont_mode(struct rradc_chip *chip,
 					  enum rradc_channel_id chan_address)
 {
 	const struct rradc_channel *chan = &rradc_chans[chan_address];
-	const struct iio_chan_spec *iio_chan = &rradc_iio_chans[chan_address];
 	int ret, i;
+	int waits = chan_address == RR_ADC_BATT_ID ? 20 : 5;
 
 	if (chan->trigger_mask == 0) {
 		dev_err(chip->dev, "Channel doesn't have a trigger mask\n");
@@ -437,7 +437,7 @@ static int rradc_read_status_in_cont_mode(struct rradc_chip *chip,
 	if (ret < 0) {
 		dev_err(chip->dev,
 			"Failed to apply trigger for channel '%s' ret=%d\n",
-			iio_chan->extend_name, ret);
+			chan->label, ret);
 		return ret;
 	}
 
@@ -452,15 +452,20 @@ static int rradc_read_status_in_cont_mode(struct rradc_chip *chip,
 	 * this is mostly for the battery ID channel which takes some
 	 * time to settle.
 	 */
-	for (i = 0; i < 5; i++) {
+	/*
+	 * MIX 2 BATT_ID can finish after the old final check at 200 ms.
+	 * Allow up to 1 s for this channel and check after the last sleep.
+	 * Other channels retain the existing 250 ms waiting budget.
+	 */
+	for (i = 0; i < waits; i++) {
 		if (rradc_is_ready(chip, chan_address))
 			break;
 		usleep_range(50000, 50000 + 500);
 	}
 
-	if (i == 5) {
+	if (i == waits && !rradc_is_ready(chip, chan_address)) {
 		dev_err(chip->dev, "Channel '%s' is not ready\n",
-			iio_chan->extend_name);
+			chan->label);
 		ret = -ETIMEDOUT;
 	}
 

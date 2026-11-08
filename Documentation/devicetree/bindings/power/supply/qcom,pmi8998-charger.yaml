@@ -14,29 +14,37 @@ properties:
     enum:
       - qcom,pmi8998-charger
       - qcom,pm660-charger
+      - xiaomi,chiron-charger
 
   reg:
     maxItems: 1
 
   interrupts:
-    maxItems: 4
+    minItems: 4
+    maxItems: 5
 
   interrupt-names:
+    minItems: 4
     items:
       - const: usb-plugin
       - const: bat-ov
       - const: wdog-bark
       - const: usbin-icl-change
+      - const: usbin-src-change
 
   io-channels:
+    minItems: 2
     items:
       - description: USB in current in uA
       - description: USB in voltage in uV
+      - description: Charger temperature in millicelsius
 
   io-channel-names:
+    minItems: 2
     items:
       - const: usbin_i
       - const: usbin_v
+      - const: charger_temp
 
   monitored-battery: true
 
@@ -47,10 +55,36 @@ required:
   - interrupt-names
   - io-channels
   - io-channel-names
-  - monitored-battery
 
 allOf:
   - $ref: power-supply.yaml#
+  - if:
+      properties:
+        compatible:
+          const: xiaomi,chiron-charger
+    then:
+      properties:
+        monitored-battery: false
+        io-channels:
+          minItems: 3
+        io-channel-names:
+          minItems: 3
+        interrupts:
+          minItems: 5
+        interrupt-names:
+          minItems: 5
+    else:
+      properties:
+        io-channels:
+          maxItems: 2
+        io-channel-names:
+          maxItems: 2
+        interrupts:
+          maxItems: 4
+        interrupt-names:
+          maxItems: 4
+      required:
+        - monitored-battery
 
 additionalProperties: false
 

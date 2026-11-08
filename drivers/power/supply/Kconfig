@@ -1187,3 +1187,11 @@ config MACSMC_POWER
 	  Say Y or M here if you have an Apple Silicon based Mac.
 
 endif # POWER_SUPPLY
+
+config CHIRON_PMI8998_BATTERY_MONITOR
+	tristate "Experimental MIX 2 PMI8998 v2 battery monitor with guarded SOC"
+	depends on POWER_SUPPLY && MFD_SPMI_PMIC && IIO
+	help
+	  Expose voltage, current, temperature, presence and a model-checked SOC
+	  estimate from the existing gauge. Capacity reads trigger ADC/IMA access.
+	  Does not load battery profiles, calibrate the gauge or control charging.

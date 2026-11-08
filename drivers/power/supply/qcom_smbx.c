@@ -15,6 +15,7 @@
 #include <linux/kernel.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeirq.h>
 #include <linux/of.h>
@@ -373,6 +374,28 @@ struct smb_init_register {
 
 /**
  * struct smb_chip - smb chip structure
+ * @chiron:		Whether the PMI8998 charger policy is enabled
+ * @charge_held:	Whether battery charging is currently held off
+ * @charge_sw_owned:	Whether software owns the charge-enable path
+ * @charge_limit:	Configured charge limit percentage
+ * @charge_hw_cfg:	Saved hardware charge-enable configuration
+ * @fast_enabled:	Whether fast charging is currently eligible
+ * @fast_hot:		Whether fast charging is thermally inhibited
+ * @fast_icl:		Current input limit used by fast charging
+ * @jeita_comp:		Configured JEITA compensation value
+ * @fast_work:		Delayed fast-charge policy worker
+ * @charger_temp_chan:	Charger die-temperature measurement channel
+ * @qc_attempted:	Whether QC negotiation has been attempted
+ * @qc_retries:		Number of bounded QC retries used
+ * @qc_active:		Whether QC negotiation is in progress
+ * @qc_authenticated:	Whether a QC adapter has authenticated
+ * @stopping:		Whether policy work must stop
+ * @qc_deadline:		Current QC authentication deadline
+ * @qc_prepare_deadline:	Deadline for QC renegotiation after cooldown
+ * @qc_work:		Delayed QC policy worker
+ * @source_irq:		QC source-change IRQ number
+ * @apsd_retries:	Number of APSD reruns used
+ * @policy_lock:	Serializes cable, QC and charge policy transitions
  * @dev:		Device reference for power_supply
  * @name:		The platform device name
  * @base:		Base address for smb registers
@@ -386,6 +409,24 @@ struct smb_init_register {
  * @chg_psy:		Charger power supply instance
  */
 struct smb_chip {
+	bool chiron;
+	bool charge_held, charge_sw_owned;
+	unsigned int charge_limit, charge_hw_cfg;
+	bool fast_enabled, fast_hot;
+	unsigned int fast_icl, jeita_comp;
+	struct delayed_work fast_work;
+	struct iio_channel *charger_temp_chan;
+	bool qc_attempted;
+	unsigned int qc_retries;
+	bool qc_active;
+	bool qc_authenticated;
+	bool stopping;
+	unsigned long qc_deadline;
+	unsigned long qc_prepare_deadline;
+	struct delayed_work qc_work;
+	int source_irq;
+	unsigned int apsd_retries;
+	struct mutex policy_lock;
 	struct device *dev;
 	const char *name;
 	unsigned int base;
@@ -412,6 +453,7 @@ static enum power_supply_property smb_properties[] = {
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_USB_TYPE,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
 };
 
 static int smb_get_prop_usb_online(struct smb_chip *chip, int *val)
@@ -466,7 +508,8 @@ static int smb_apsd_get_charger_type(struct smb_chip *chip, int *val)
 
 	if (stat & CDP_CHARGER_BIT)
 		*val = POWER_SUPPLY_USB_TYPE_CDP;
-	else if (stat & (DCP_CHARGER_BIT | OCP_CHARGER_BIT | FLOAT_CHARGER_BIT))
+	else if (stat & (DCP_CHARGER_BIT | OCP_CHARGER_BIT | QC_2P0_BIT | QC_3P0_BIT |
+			(chip->chiron ? 0 : FLOAT_CHARGER_BIT)))
 		*val = POWER_SUPPLY_USB_TYPE_DCP;
 	else /* SDP_CHARGER_BIT (or others) */
 		*val = POWER_SUPPLY_USB_TYPE_SDP;
@@ -547,7 +590,42 @@ static int smb_set_current_limit(struct smb_chip *chip, unsigned int val)
 			    val_raw);
 }
 
-static void smb_status_change_work(struct work_struct *work)
+/* Preserve firmware FV and hardware JEITA settings.
+ * Manage charge and USB input current; the extcon/regulator drivers
+ * retain Type-C and OTG ownership. Do not reinterpret floating cables as DCP.
+ */
+static int smb_chiron_input_limit(struct smb_chip *chip, unsigned int ua)
+{
+	unsigned int typec;
+	bool override;
+	int rc;
+
+	rc = regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_1, &typec);
+	if (rc)
+		return rc;
+	/* An Rp 1.5/3 A advertisement otherwise bypasses SDP mode limits.
+	 * Match downstream's override rule for non-default Type-C sources.
+	 */
+	override = ua > SDP_CURRENT_UA ||
+		   (typec & (UFP_TYPEC_RD1P5_BIT | UFP_TYPEC_RD3P0_BIT));
+	rc = smb_set_current_limit(chip, ua);
+	if (rc)
+		return rc;
+	rc = regmap_update_bits(chip->regmap, chip->base + USBIN_ICL_OPTIONS,
+		CFG_USB3P0_SEL_BIT | USB51_MODE_BIT | USBIN_MODE_CHG_BIT,
+		override ? USBIN_MODE_CHG_BIT : USB51_MODE_BIT);
+	if (rc)
+		return rc;
+	return regmap_update_bits(chip->regmap, chip->base + USBIN_LOAD_CFG,
+		ICL_OVERRIDE_AFTER_APSD_BIT,
+		override ? ICL_OVERRIDE_AFTER_APSD_BIT : 0);
+}
+
+#include "chiron-charge-limit.h"
+#include "chiron-fast-charge.h"
+#include "chiron-qc-policy.h"
+
+static void smb_update_charger(struct work_struct *work)
 {
 	unsigned int charger_type, current_ua;
 	int usb_online = 0;
@@ -556,8 +634,11 @@ static void smb_status_change_work(struct work_struct *work)
 
 	chip = container_of(work, struct smb_chip, status_change_work.work);
 
-	smb_get_prop_usb_online(chip, &usb_online);
-	if (!usb_online)
+	rc = smb_get_prop_usb_online(chip, &usb_online);
+	if (rc || !usb_online)
+		return;
+
+	if (chip->chiron && chip->qc_active && !chip->qc_authenticated)
 		return;
 
 	for (count = 0; count < 3; count++) {
@@ -574,6 +655,8 @@ static void smb_status_change_work(struct work_struct *work)
 	}
 
 	if (rc < 0) {
+		if (chip->chiron && chip->apsd_retries++ >= 3)
+			return;
 		rc = regmap_update_bits(chip->regmap, chip->base + CMD_APSD,
 					APSD_RERUN_BIT, APSD_RERUN_BIT);
 		schedule_delayed_work(&chip->status_change_work,
@@ -587,7 +670,8 @@ static void smb_status_change_work(struct work_struct *work)
 		current_ua = CDP_CURRENT_UA;
 		break;
 	case POWER_SUPPLY_USB_TYPE_DCP:
-		current_ua = DCP_CURRENT_UA;
+		current_ua = chip->chiron && chip->qc_authenticated ?
+			     chip->fast_icl : DCP_CURRENT_UA;
 		break;
 	case POWER_SUPPLY_USB_TYPE_SDP:
 	default:
@@ -595,8 +679,49 @@ static void smb_status_change_work(struct work_struct *work)
 		break;
 	}
 
-	smb_set_current_limit(chip, current_ua);
+	if (chip->chiron && !chip->qc_attempted &&
+	    charger_type == POWER_SUPPLY_USB_TYPE_DCP) {
+		/* Publish the dedicated source first so the event-driven ACM
+		 * service releases D+/D- before hardware authentication starts.
+		 */
+		if (!chip->qc_prepare_deadline) {
+			chip->qc_prepare_deadline = jiffies + msecs_to_jiffies(1000);
+			power_supply_changed(chip->chg_psy);
+		}
+		if (time_before(jiffies, chip->qc_prepare_deadline)) {
+			if (chip->qc_retries)
+				smb_chiron_input_limit(chip, DCP_CURRENT_UA);
+			mod_delayed_work(system_dfl_wq, &chip->status_change_work,
+					 chip->qc_prepare_deadline - jiffies);
+			return;
+		}
+		rc = smb_chiron_qc_start(chip);
+		if (rc) {
+			int stop_rc = smb_chiron_qc_stop(chip);
+
+			dev_err_ratelimited(chip->dev, "QC start failed: %d, reset: %d\n",
+					    rc, stop_rc);
+		}
+		if (chip->qc_active)
+			return;
+	}
+	if (chip->chiron)
+		rc = smb_chiron_input_limit(chip, current_ua);
+	else
+		rc = smb_set_current_limit(chip, current_ua);
+	if (rc)
+		dev_err_ratelimited(chip->dev, "Input current update failed: %d\n", rc);
 	power_supply_changed(chip->chg_psy);
+}
+
+static void smb_status_change_work(struct work_struct *work)
+{
+	struct smb_chip *chip = container_of(work, struct smb_chip, status_change_work.work);
+
+	mutex_lock(&chip->policy_lock);
+	if (!chip->stopping)
+		smb_update_charger(work);
+	mutex_unlock(&chip->policy_lock);
 }
 
 static int smb_get_iio_chan(struct smb_chip *chip, struct iio_channel *chan,
@@ -605,9 +730,11 @@ static int smb_get_iio_chan(struct smb_chip *chip, struct iio_channel *chan,
 	int rc;
 	union power_supply_propval status;
 
-	rc = power_supply_get_property(chip->chg_psy, POWER_SUPPLY_PROP_STATUS,
+	rc = power_supply_get_property(chip->chg_psy, POWER_SUPPLY_PROP_ONLINE,
 				       &status);
-	if (rc < 0 || status.intval != POWER_SUPPLY_STATUS_CHARGING) {
+	if (rc < 0)
+		return rc;
+	if (!status.intval) {
 		*val = 0;
 		return 0;
 	}
@@ -632,26 +759,19 @@ static int smb_get_prop_health(struct smb_chip *chip, int *val)
 		return rc;
 	}
 
-	switch (stat) {
-	case CHARGER_ERROR_STATUS_BAT_OV_BIT:
+	if (stat & CHARGER_ERROR_STATUS_BAT_OV_BIT)
 		*val = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
-		return 0;
-	case BAT_TEMP_STATUS_TOO_COLD_BIT:
+	else if (stat & BAT_TEMP_STATUS_TOO_COLD_BIT)
 		*val = POWER_SUPPLY_HEALTH_COLD;
-		return 0;
-	case BAT_TEMP_STATUS_TOO_HOT_BIT:
+	else if (stat & BAT_TEMP_STATUS_TOO_HOT_BIT)
 		*val = POWER_SUPPLY_HEALTH_OVERHEAT;
-		return 0;
-	case BAT_TEMP_STATUS_COLD_SOFT_LIMIT_BIT:
+	else if (stat & BAT_TEMP_STATUS_COLD_SOFT_LIMIT_BIT)
 		*val = POWER_SUPPLY_HEALTH_COOL;
-		return 0;
-	case BAT_TEMP_STATUS_HOT_SOFT_LIMIT_BIT:
+	else if (stat & BAT_TEMP_STATUS_HOT_SOFT_LIMIT_BIT)
 		*val = POWER_SUPPLY_HEALTH_WARM;
-		return 0;
-	default:
+	else
 		*val = POWER_SUPPLY_HEALTH_GOOD;
-		return 0;
-	}
+	return 0;
 }
 
 static int smb_get_property(struct power_supply *psy,
@@ -661,6 +781,9 @@ static int smb_get_property(struct power_supply *psy,
 	struct smb_chip *chip = power_supply_get_drvdata(psy);
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		val->intval = READ_ONCE(chip->charge_limit);
+		return 0;
 	case POWER_SUPPLY_PROP_MANUFACTURER:
 		val->strval = "Qualcomm";
 		return 0;
@@ -695,6 +818,34 @@ static int smb_set_property(struct power_supply *psy,
 {
 	struct smb_chip *chip = power_supply_get_drvdata(psy);
 
+	if (chip->chiron) {
+		unsigned int old;
+		int rc, online;
+
+		if (psp != POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD)
+			return -EOPNOTSUPP;
+		if (val->intval != 85 && val->intval != 100)
+			return -EINVAL;
+		mutex_lock(&chip->policy_lock);
+		if (chip->stopping) {
+			rc = -ESHUTDOWN;
+			goto limit_out;
+		}
+		rc = smb_get_prop_usb_online(chip, &online);
+		if (rc)
+			goto limit_out;
+		old = chip->charge_limit;
+		WRITE_ONCE(chip->charge_limit, val->intval);
+		rc = smb_chiron_limit_update(chip, online);
+		if (rc)
+			WRITE_ONCE(chip->charge_limit, old);
+limit_out:
+		mutex_unlock(&chip->policy_lock);
+		if (!rc)
+			power_supply_changed(chip->chg_psy);
+		return rc;
+	}
+
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 		return regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
@@ -710,6 +861,10 @@ static int smb_set_property(struct power_supply *psy,
 static int smb_property_is_writable(struct power_supply *psy,
 				     enum power_supply_property psp)
 {
+	struct smb_chip *chip = power_supply_get_drvdata(psy);
+
+	if (chip->chiron)
+		return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
@@ -724,8 +879,9 @@ static irqreturn_t smb_handle_batt_overvoltage(int irq, void *data)
 	struct smb_chip *chip = data;
 	unsigned int status;
 
-	regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_2,
-		    &status);
+	if (regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_2,
+		    &status))
+		return IRQ_HANDLED;
 
 	if (status & CHARGER_ERROR_STATUS_BAT_OV_BIT) {
 		/* The hardware stops charging automatically */
@@ -739,6 +895,30 @@ static irqreturn_t smb_handle_batt_overvoltage(int irq, void *data)
 static irqreturn_t smb_handle_usb_plugin(int irq, void *data)
 {
 	struct smb_chip *chip = data;
+
+	/* Drop the previous adapter's limit before detecting a new cable. */
+	if (chip->chiron) {
+		int rc;
+
+		mutex_lock(&chip->policy_lock);
+		if (chip->stopping) {
+			mutex_unlock(&chip->policy_lock);
+			return IRQ_HANDLED;
+		}
+		rc = smb_chiron_qc_stop(chip);
+		if (rc)
+			dev_err_ratelimited(chip->dev, "QC cable reset failed: %d\n", rc);
+		chip->qc_attempted = false;
+		chip->qc_retries = 0;
+		chip->qc_prepare_deadline = 0;
+		chip->qc_authenticated = false;
+		chip->apsd_retries = 0;
+		mod_delayed_work(system_dfl_wq, &chip->fast_work, msecs_to_jiffies(5000));
+		rc = smb_chiron_input_limit(chip, SDP_CURRENT_UA);
+		mutex_unlock(&chip->policy_lock);
+		if (rc)
+			dev_err_ratelimited(chip->dev, "Safe input reset failed: %d\n", rc);
+	}
 
 	power_supply_changed(chip->chg_psy);
 
@@ -764,7 +944,7 @@ static irqreturn_t smb_handle_wdog_bark(int irq, void *data)
 
 	power_supply_changed(chip->chg_psy);
 
-	rc = regmap_write(chip->regmap, BARK_BITE_WDOG_PET,
+	rc = regmap_write(chip->regmap, chip->base + BARK_BITE_WDOG_PET,
 			  BARK_BITE_WDOG_PET_BIT);
 	if (rc < 0)
 		dev_err(chip->dev, "Couldn't pet the dog rc=%d\n", rc);
@@ -943,6 +1123,10 @@ static int smb_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	chip->dev = &pdev->dev;
+	chip->charge_limit = 100;
+	mutex_init(&chip->policy_lock);
+	chip->chiron = of_device_is_compatible(pdev->dev.of_node,
+					      "xiaomi,chiron-charger");
 	chip->name = pdev->name;
 
 	chip->regmap = dev_get_regmap(pdev->dev.parent, NULL);
@@ -966,7 +1150,33 @@ static int smb_probe(struct platform_device *pdev)
 				     "Couldn't get usbin_i IIO channel\n");
 	}
 
-	rc = smb_init_hw(chip);
+	if (chip->chiron) {
+		unsigned int jeita, fv, fcc;
+
+		chip->fast_icl = DCP_CURRENT_UA;
+		chip->charger_temp_chan = devm_iio_channel_get(chip->dev, "charger_temp");
+		if (IS_ERR(chip->charger_temp_chan))
+			return dev_err_probe(chip->dev, PTR_ERR(chip->charger_temp_chan),
+					     "Charger temperature unavailable\n");
+		rc = regmap_read(chip->regmap, chip->base + 0x92, &chip->jeita_comp);
+		if (rc)
+			return rc;
+
+		rc = regmap_read(chip->regmap, chip->base + 0x90, &jeita);
+		if (rc)
+			return rc;
+		rc = regmap_read(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG, &fv);
+		if (rc)
+			return rc;
+		rc = regmap_read(chip->regmap, chip->base + FAST_CHARGE_CURRENT_CFG, &fcc);
+		if (rc)
+			return rc;
+		/* Stock calibration is 4.395 V, 1 A and all JEITA protections on. */
+		if ((jeita & 0x1f) != 0x1f || fv > 121 || !fcc || fcc > 132)
+			return dev_err_probe(chip->dev, -EINVAL,
+				"Unsupported firmware charge limits/protection\n");
+	}
+	rc = chip->chiron ? smb_chiron_fast_reset(chip) : smb_init_hw(chip);
 	if (rc < 0)
 		return rc;
 
@@ -977,6 +1187,8 @@ static int smb_probe(struct platform_device *pdev)
 	if (!desc)
 		return -ENOMEM;
 	memcpy(desc, &smb_psy_desc, sizeof(smb_psy_desc));
+	if (!chip->chiron)
+		desc->num_properties--;
 	desc->name =
 		devm_kasprintf(chip->dev, GFP_KERNEL, "%s-charger",
 			       (const char *)device_get_match_data(chip->dev));
@@ -989,7 +1201,7 @@ static int smb_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, PTR_ERR(chip->chg_psy),
 				     "failed to register power supply\n");
 
-	rc = power_supply_get_battery_info(chip->chg_psy, &chip->batt_info);
+	rc = chip->chiron ? 0 : power_supply_get_battery_info(chip->chg_psy, &chip->batt_info);
 	if (rc)
 		return dev_err_probe(chip->dev, rc,
 				     "Failed to get battery info\n");
@@ -1000,11 +1212,23 @@ static int smb_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, rc,
 				     "Failed to init status change work\n");
 
-	rc = (chip->batt_info->voltage_max_design_uv - 3487500) / 7500 + 1;
-	rc = regmap_update_bits(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
-				FLOAT_VOLTAGE_SETTING_MASK, rc);
-	if (rc < 0)
-		return dev_err_probe(chip->dev, rc, "Couldn't set vbat max\n");
+	rc = devm_delayed_work_autocancel(chip->dev, &chip->qc_work,
+					  smb_chiron_qc_work);
+	if (rc)
+		return rc;
+
+	rc = devm_delayed_work_autocancel(chip->dev, &chip->fast_work,
+					  smb_chiron_fast_work);
+	if (rc)
+		return rc;
+
+	if (!chip->chiron) {
+		rc = (chip->batt_info->voltage_max_design_uv - 3487500) / 7500 + 1;
+		rc = regmap_update_bits(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
+					FLOAT_VOLTAGE_SETTING_MASK, rc);
+		if (rc < 0)
+			return dev_err_probe(chip->dev, rc, "Couldn't set vbat max\n");
+	}
 
 	rc = smb_init_irq(chip, &irq, "bat-ov", smb_handle_batt_overvoltage);
 	if (rc < 0)
@@ -1023,6 +1247,13 @@ static int smb_probe(struct platform_device *pdev)
 	if (rc < 0)
 		return rc;
 
+	if (chip->chiron) {
+		rc = smb_init_irq(chip, &chip->source_irq, "usbin-src-change",
+				  smb_chiron_source_irq);
+		if (rc)
+			return rc;
+	}
+
 	devm_device_init_wakeup(chip->dev);
 
 	rc = devm_pm_set_wake_irq(chip->dev, chip->cable_irq);
@@ -1033,11 +1264,42 @@ static int smb_probe(struct platform_device *pdev)
 
 	/* Initialise charger state */
 	schedule_delayed_work(&chip->status_change_work, 0);
+	if (chip->chiron)
+		mod_delayed_work(system_dfl_wq, &chip->fast_work, msecs_to_jiffies(5000));
 
 	return 0;
 }
 
+static void smb_chiron_shutdown(struct platform_device *pdev)
+{
+	struct smb_chip *chip = platform_get_drvdata(pdev);
+	int rc;
+
+	if (!chip->chiron)
+		return;
+	mutex_lock(&chip->policy_lock);
+	chip->stopping = true;
+	mutex_unlock(&chip->policy_lock);
+	disable_irq(chip->cable_irq);
+	disable_irq(chip->source_irq);
+	cancel_delayed_work_sync(&chip->status_change_work);
+	cancel_delayed_work_sync(&chip->qc_work);
+	cancel_delayed_work_sync(&chip->fast_work);
+	mutex_lock(&chip->policy_lock);
+	chip->charge_limit = 100;
+	if (chip->charge_sw_owned || chip->charge_held)
+		smb_chiron_charge_hold(chip, false);
+	rc = smb_chiron_qc_stop(chip);
+	if (rc)
+		dev_err(chip->dev, "QC shutdown fallback failed: %d\n", rc);
+	rc = smb_chiron_input_limit(chip, SDP_CURRENT_UA);
+	if (rc)
+		dev_err(chip->dev, "Shutdown input limit failed: %d\n", rc);
+	mutex_unlock(&chip->policy_lock);
+}
+
 static const struct of_device_id smb_match_id_table[] = {
+	{ .compatible = "xiaomi,chiron-charger", .data = "chiron" },
 	{ .compatible = "qcom,pmi8998-charger", .data = "pmi8998" },
 	{ .compatible = "qcom,pm660-charger", .data = "pm660" },
 	{ /* sentinal */ }
@@ -1046,6 +1308,8 @@ MODULE_DEVICE_TABLE(of, smb_match_id_table);
 
 static struct platform_driver qcom_spmi_smb = {
 	.probe = smb_probe,
+	.shutdown = smb_chiron_shutdown,
+	.remove = smb_chiron_shutdown,
 	.driver = {
 		.name = "qcom-smbx-charger",
 		.of_match_table = smb_match_id_table,
