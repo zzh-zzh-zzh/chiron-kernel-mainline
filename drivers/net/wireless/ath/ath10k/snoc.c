@@ -1736,6 +1736,7 @@ static int ath10k_snoc_probe(struct platform_device *pdev)
 	struct device *dev;
 	struct ath10k *ar;
 	u32 msa_size;
+	u64 dma_mask;
 	int ret;
 	u32 i;
 
@@ -1746,7 +1747,12 @@ static int ath10k_snoc_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	ret = dma_set_mask_and_coherent(dev, drv_data->dma_mask);
+	/* Use the verified host DMA mapping range on Chiron. */
+	dma_mask = drv_data->dma_mask;
+	if (of_machine_is_compatible("xiaomi,chiron"))
+		dma_mask = DMA_BIT_MASK(32);
+
+	ret = dma_set_mask_and_coherent(dev, dma_mask);
 	if (ret) {
 		dev_err(dev, "failed to set dma mask: %d\n", ret);
 		return ret;

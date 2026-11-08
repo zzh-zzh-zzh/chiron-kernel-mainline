@@ -290,8 +290,13 @@ static int ath10k_send_key(struct ath10k_vif *arvif,
 		key->flags |= IEEE80211_KEY_FLAG_GENERATE_IV;
 
 	if (cmd == DISABLE_KEY) {
-		if (flags & WMI_KEY_GROUP) {
-			/* Not all hardware handles group-key deletion operation
+		if ((flags & WMI_KEY_GROUP) ||
+		    (of_machine_is_compatible("xiaomi,chiron") &&
+		     ar->hw_rev == ATH10K_HW_WCN3990)) {
+			/* Chiron stock WCN3990 also crashes on pairwise NONE:
+			 * invalidate with a random key and wait for real completion.
+			 * The subsequent peer teardown still removes its key state.
+			 * Not all hardware handles group-key deletion operation
 			 * correctly. Replace the key with a junk value to invalidate it.
 			 */
 			get_random_bytes(key->key, key->keylen);
@@ -3198,18 +3203,44 @@ static void ath10k_bss_disassoc(struct ieee80211_hw *hw,
 	ath10k_dbg(ar, ATH10K_DBG_MAC, "mac vdev %i disassoc bssid %pM\n",
 		   arvif->vdev_id, arvif->bssid);
 
+	/* Fallback STOP for disassociation paths without a BSS peer. */
+	if (of_machine_is_compatible("xiaomi,chiron") &&
+	    ar->hw_rev == ATH10K_HW_WCN3990) {
+		if (arvif->chiron_disassoc_failed)
+			return;
+		if (!arvif->is_up)
+			goto clear_state;
+		if (arvif->is_started) {
+			ret = ath10k_vdev_stop(arvif);
+			if (ret) {
+				ath10k_warn(ar, "CHIRON STOP before DOWN failed: %d\n", ret);
+				return;
+			}
+			arvif->is_started = false;
+			arvif->chiron_disassoc_stopped = true;
+		}
+	}
 	ret = ath10k_wmi_vdev_down(ar, arvif->vdev_id);
 	if (ret)
 		ath10k_warn(ar, "failed to down vdev %i: %d\n",
 			    arvif->vdev_id, ret);
 
+clear_state:
 	arvif->def_wep_key_idx = -1;
 
-	ret = ath10k_mac_vif_recalc_txbf(ar, vif, vht_cap);
-	if (ret) {
-		ath10k_warn(ar, "failed to recalc txbf for vdev %i: %d\n",
-			    arvif->vdev_id, ret);
-		return;
+	/* Chiron STA reset was sent before STOP with the BSS peer present.
+	 * An inactive STA has no BSS context on which to apply this parameter.
+	 */
+	if (!(of_machine_is_compatible("xiaomi,chiron") &&
+	      ar->hw_rev == ATH10K_HW_WCN3990 &&
+	      vif->type == NL80211_IFTYPE_STATION)) {
+		ret = ath10k_mac_vif_recalc_txbf(ar, vif, vht_cap);
+		if (ret) {
+			ath10k_warn(ar, "failed to recalc txbf for vdev %i: %d\n",
+				    arvif->vdev_id, ret);
+			return;
+		}
+
 	}
 
 	arvif->is_up = false;
@@ -7490,6 +7521,47 @@ static void ath10k_mac_vif_stations_tid_conf(void *data,
 	ieee80211_queue_work(iter_data->ar->hw, &arsta->tid_config_wk);
 }
 
+/* Stop while the BSS peer still exists, as in the vendor delBSS flow.
+ * Scope this compatibility ordering to the stock Chiron WCN3990 firmware.
+ */
+static int ath10k_chiron_stop_bss_peer(struct ath10k_vif *arvif,
+                                     struct ieee80211_sta *sta)
+{
+	struct ath10k *ar = arvif->ar;
+	struct ieee80211_sta_vht_cap vht_cap = {};
+	int ret;
+
+	lockdep_assert_held(&ar->conf_mutex);
+	if (!of_machine_is_compatible("xiaomi,chiron") ||
+	    ar->hw_rev != ATH10K_HW_WCN3990 ||
+	    arvif->vif->type != NL80211_IFTYPE_STATION || sta->tdls ||
+	    !ether_addr_equal(sta->addr, arvif->bssid) ||
+	    !arvif->is_started)
+		return 0;
+	if (arvif->chiron_disassoc_failed)
+		return -EIO;
+	/* Only an established BSS has the firmware context needed for TXBF.
+	 * Failed authentication still needs STOP before deleting its peer.
+	 */
+	if (arvif->is_up) {
+		ret = ath10k_mac_vif_recalc_txbf(ar, arvif->vif, vht_cap);
+		if (ret) {
+			arvif->chiron_disassoc_failed = true;
+			ath10k_warn(ar, "CHIRON TXBF reset before STOP failed: %d\n", ret);
+			return ret;
+		}
+	}
+	ret = ath10k_vdev_stop(arvif);
+	if (ret) {
+		arvif->chiron_disassoc_failed = true;
+		ath10k_warn(ar, "CHIRON STOP before PEER_DELETE failed: %d\n", ret);
+		return ret;
+	}
+	arvif->is_started = false;
+	arvif->chiron_disassoc_stopped = true;
+	return 0;
+}
+
 static int ath10k_sta_state(struct ieee80211_hw *hw,
 			    struct ieee80211_vif *vif,
 			    struct ieee80211_sta *sta,
@@ -7500,6 +7572,7 @@ static int ath10k_sta_state(struct ieee80211_hw *hw,
 	struct ath10k_vif *arvif = (void *)vif->drv_priv;
 	struct ath10k_sta *arsta = (struct ath10k_sta *)sta->drv_priv;
 	struct ath10k_peer *peer;
+	bool finish_unassoc_stop;
 	int ret = 0;
 	int i;
 
@@ -7645,10 +7718,29 @@ static int ath10k_sta_state(struct ieee80211_hw *hw,
 					    WMI_TDLS_PEER_STATE_TEARDOWN, ret);
 		}
 
+		finish_unassoc_stop = !arvif->is_up && arvif->is_started;
+		ret = ath10k_chiron_stop_bss_peer(arvif, sta);
+		if (ret)
+			goto exit;
+
 		ret = ath10k_peer_delete(ar, arvif->vdev_id, sta->addr);
 		if (ret)
 			ath10k_warn(ar, "failed to delete peer %pM for vdev %d: %i\n",
 				    sta->addr, arvif->vdev_id, ret);
+
+		/* Complete the stock STOP/DELETE/DOWN sequence after a failed
+		 * association. The Chiron stop helper sets this flag;
+		 * established BSS teardown sends DOWN in bss_disassoc instead.
+		 */
+		if (!ret && finish_unassoc_stop &&
+		    arvif->chiron_disassoc_stopped) {
+			ret = ath10k_wmi_vdev_down(ar, arvif->vdev_id);
+			if (ret) {
+				arvif->chiron_disassoc_failed = true;
+				ath10k_warn(ar, "CHIRON DOWN after failed association: %d\n",
+					    ret);
+			}
+		}
 
 		ath10k_mac_dec_num_stations(arvif, sta);
 
@@ -9076,6 +9168,17 @@ ath10k_mac_op_unassign_vif_chanctx(struct ieee80211_hw *hw,
 		   "mac chanctx unassign ptr %p vdev_id %i\n",
 		   ctx, arvif->vdev_id);
 
+	if (arvif->chiron_disassoc_failed) {
+		mutex_unlock(&ar->conf_mutex);
+		return;
+	}
+	/* Disassociation already stopped this specific vdev synchronously. */
+	if (arvif->chiron_disassoc_stopped) {
+		WARN_ON(arvif->is_started);
+		arvif->chiron_disassoc_stopped = false;
+		mutex_unlock(&ar->conf_mutex);
+		return;
+	}
 	WARN_ON(!arvif->is_started);
 
 	if (vif->type == NL80211_IFTYPE_MONITOR) {

@@ -7,6 +7,7 @@
  */
 
 #include <linux/export.h>
+#include <linux/of.h>
 
 #include "core.h"
 #include "htc.h"
@@ -15,6 +16,7 @@
 #include "debug.h"
 #include "trace.h"
 #include "mac.h"
+#include "chiron-amsdu-policy.h"
 
 #include <linux/log2.h>
 #include <linux/bitfield.h>
@@ -285,12 +287,29 @@ int ath10k_htt_rx_ring_refill(struct ath10k *ar)
 	return ret;
 }
 
+static void ath10k_chiron_amsdu_expire(struct timer_list *t)
+{
+	struct ath10k_htt *htt = timer_container_of(htt, t, chiron_amsdu.timer);
+
+	spin_lock_bh(&htt->rx_ring.lock);
+	if (!skb_queue_empty(&htt->chiron_amsdu.pending) && time_after_eq(jiffies, htt->chiron_amsdu.deadline)) {
+		ath10k_warn(htt->ar, "CHIRON AMSDU TIMEOUT peer=%u vdev=%u tid=%u held=%u\n",
+			    htt->chiron_amsdu.peer_id, htt->chiron_amsdu.vdev_id,
+			    htt->chiron_amsdu.tid, skb_queue_len(&htt->chiron_amsdu.pending));
+		htt->rx_confused = true;
+		__skb_queue_purge(&htt->chiron_amsdu.pending);
+	}
+	spin_unlock_bh(&htt->rx_ring.lock);
+}
+
 void ath10k_htt_rx_free(struct ath10k_htt *htt)
 {
 	if (htt->ar->bus_param.dev_type == ATH10K_DEV_TYPE_HL)
 		return;
 
 	timer_delete_sync(&htt->rx_ring.refill_retry_timer);
+	if (htt->chiron_amsdu.enabled)
+		timer_delete_sync(&htt->chiron_amsdu.timer);
 
 	skb_queue_purge(&htt->rx_msdus_q);
 	skb_queue_purge(&htt->rx_in_ord_compl_q);
@@ -298,6 +317,7 @@ void ath10k_htt_rx_free(struct ath10k_htt *htt)
 
 	spin_lock_bh(&htt->rx_ring.lock);
 	ath10k_htt_rx_ring_free(htt);
+	__skb_queue_purge(&htt->chiron_amsdu.pending);
 	spin_unlock_bh(&htt->rx_ring.lock);
 
 	dma_free_coherent(htt->ar->dev,
@@ -836,6 +856,11 @@ int ath10k_htt_rx_alloc(struct ath10k_htt *htt)
 	timer_setup(timer, ath10k_htt_rx_ring_refill_retry, 0);
 
 	spin_lock_init(&htt->rx_ring.lock);
+	__skb_queue_head_init(&htt->chiron_amsdu.pending);
+	htt->chiron_amsdu.enabled = of_machine_is_compatible("xiaomi,chiron") &&
+		ar->hw_rev == ATH10K_HW_WCN3990 && ar->hw_params.target_64bit;
+	if (htt->chiron_amsdu.enabled)
+		timer_setup(&htt->chiron_amsdu.timer, ath10k_chiron_amsdu_expire, 0);
 
 	htt->rx_ring.fill_cnt = 0;
 	htt->rx_ring.sw_rd_idx.msdu_payld = 0;
@@ -3259,6 +3284,96 @@ static void ath10k_htt_rx_h_rx_offload(struct ath10k *ar,
 	}
 }
 
+/* All descriptors below belong to buffers already unmapped by pop_paddr. */
+static int ath10k_chiron_amsdu_boundary(struct ath10k *ar,
+                                      struct sk_buff_head *list,
+                                      unsigned int held, bool continuation)
+{
+	struct ath10k_hw_params *hw = &ar->hw_params;
+	struct sk_buff *msdu;
+	struct htt_rx_desc *rxd;
+	struct rx_msdu_end_common *end;
+	unsigned char flags[CHIRON_AMSDU_MAX];
+	unsigned int n = 0;
+	u32 info;
+
+	skb_queue_walk(list, msdu) {
+		if (n == CHIRON_AMSDU_MAX)
+			return -1;
+		rxd = HTT_RX_BUF_TO_RX_DESC(hw, msdu->data - hw->rx_desc_ops->rx_desc_size);
+		end = ath10k_htt_rx_desc_get_msdu_end(hw, rxd);
+		info = le32_to_cpu(end->info0);
+		flags[n++] = (info & RX_MSDU_END_INFO0_FIRST_MSDU ? CHIRON_AMSDU_FIRST : 0) |
+			     (info & RX_MSDU_END_INFO0_LAST_MSDU ? CHIRON_AMSDU_LAST : 0);
+		if (info & RX_MSDU_END_INFO0_LAST_MSDU)
+			break;
+	}
+	return ath10k_chiron_amsdu_prefix(flags, n, held, continuation);
+}
+
+static void ath10k_chiron_amsdu_abort(struct ath10k_htt *htt)
+{
+	if (!htt->chiron_amsdu.enabled)
+		return;
+	timer_delete(&htt->chiron_amsdu.timer);
+	__skb_queue_purge(&htt->chiron_amsdu.pending);
+}
+
+static int ath10k_chiron_amsdu_resume(struct ath10k *ar,
+                                    struct sk_buff_head *list,
+                                    u16 peer, u8 vdev, u8 tid,
+                                    bool offload, bool frag)
+{
+	struct ath10k_htt *htt = &ar->htt;
+	unsigned int held;
+	int boundary;
+
+	if (!htt->chiron_amsdu.enabled ||
+	    skb_queue_empty(&htt->chiron_amsdu.pending))
+		return 0;
+	/* Other flows/offloaded data may be processed, but never joined. */
+	if (offload || peer != htt->chiron_amsdu.peer_id ||
+	    vdev != htt->chiron_amsdu.vdev_id || tid != htt->chiron_amsdu.tid)
+		return 0;
+	held = skb_queue_len(&htt->chiron_amsdu.pending);
+	boundary = ath10k_chiron_amsdu_boundary(ar, list, held, true);
+	if (frag || time_after_eq(jiffies, htt->chiron_amsdu.deadline) || boundary < 0) {
+		ath10k_warn(ar, "CHIRON AMSDU REJECT peer=%u vdev=%u tid=%u held=%u frag=%u boundary=%d expired=%u\n",
+			    peer, vdev, tid, held, frag, boundary,
+			    time_after_eq(jiffies, htt->chiron_amsdu.deadline));
+		return -EIO;
+	}
+	timer_delete(&htt->chiron_amsdu.timer);
+	/* Head insertion preserves the FIRST descriptor/header and original order. */
+	skb_queue_splice_init(&htt->chiron_amsdu.pending, list);
+	return 1;
+}
+
+static bool ath10k_chiron_amsdu_hold(struct ath10k *ar,
+                                   struct sk_buff_head *list,
+                                   u16 peer, u8 vdev, u8 tid,
+                                   bool offload, bool frag, bool resumed)
+{
+	struct ath10k_htt *htt = &ar->htt;
+
+	if (!htt->chiron_amsdu.enabled || offload || frag ||
+	    !skb_queue_empty(&htt->chiron_amsdu.pending) ||
+	    ath10k_chiron_amsdu_boundary(ar, list, 0, false) != 0)
+		return false;
+	if (resumed) {
+		if (time_after_eq(jiffies, htt->chiron_amsdu.deadline))
+			return false;
+	} else {
+		htt->chiron_amsdu.deadline = jiffies + msecs_to_jiffies(CHIRON_AMSDU_TIMEOUT_MS);
+	}
+	htt->chiron_amsdu.peer_id = peer;
+	htt->chiron_amsdu.vdev_id = vdev;
+	htt->chiron_amsdu.tid = tid;
+	skb_queue_splice_init(list, &htt->chiron_amsdu.pending);
+	mod_timer(&htt->chiron_amsdu.timer, htt->chiron_amsdu.deadline);
+	return true;
+}
+
 static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
 {
 	struct ath10k_htt *htt = &ar->htt;
@@ -3272,6 +3387,7 @@ static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
 	u8 tid;
 	bool offload;
 	bool frag;
+	bool resumed = false;
 	int ret;
 
 	lockdep_assert_held(&htt->rx_ring.lock);
@@ -3313,6 +3429,7 @@ static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
 	if (ret < 0) {
 		ath10k_warn(ar, "failed to pop paddr list: %d\n", ret);
 		htt->rx_confused = true;
+		ath10k_chiron_amsdu_abort(htt);
 		return -EIO;
 	}
 
@@ -3321,6 +3438,15 @@ static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
 	 */
 	if (offload)
 		ath10k_htt_rx_h_rx_offload(ar, &list);
+
+	ret = ath10k_chiron_amsdu_resume(ar, &list, peer_id, vdev_id, tid, offload, frag);
+	if (ret < 0) {
+		htt->rx_confused = true;
+		ath10k_chiron_amsdu_abort(htt);
+		__skb_queue_purge(&list);
+		return -EIO;
+	}
+	resumed = ret > 0;
 
 	while (!skb_queue_empty(&list)) {
 		__skb_queue_head_init(&amsdu);
@@ -3338,13 +3464,18 @@ static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
 			ath10k_htt_rx_h_mpdu(ar, &amsdu, status, false, NULL,
 					     NULL, peer_id, frag);
 			ath10k_htt_rx_h_enqueue(ar, &amsdu, status);
+			resumed = false;
 			break;
 		case -EAGAIN:
+			if (ath10k_chiron_amsdu_hold(ar, &list, peer_id, vdev_id,
+						   tid, offload, frag, resumed))
+				return 0;
 			fallthrough;
 		default:
 			/* Should not happen. */
 			ath10k_warn(ar, "failed to extract amsdu: %d\n", ret);
 			htt->rx_confused = true;
+			ath10k_chiron_amsdu_abort(htt);
 			__skb_queue_purge(&list);
 			return -EIO;
 		}

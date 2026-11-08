@@ -1881,6 +1881,16 @@ struct ath10k_htt {
 	 * used to avoid further failures
 	 */
 	bool rx_confused;
+	/* Chiron/WCN3990 continuation; rx_ring.lock protects it. */
+	struct {
+		bool enabled;
+		struct sk_buff_head pending;
+		struct timer_list timer;
+		unsigned long deadline;
+		u16 peer_id;
+		u8 vdev_id;
+		u8 tid;
+	} chiron_amsdu;
 	atomic_t num_mpdus_ready;
 
 	/* This is used to group tx/rx completions separately and process them

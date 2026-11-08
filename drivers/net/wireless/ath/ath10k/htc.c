@@ -995,9 +995,6 @@ int ath10k_htc_wait_target(struct ath10k_htc *htc)
 			   htc->alt_data_credit_size);
 	}
 
-	INIT_WORK(&ar->bundle_tx_work, ath10k_htc_bundle_tx_work);
-	INIT_WORK(&ar->tx_complete_work, ath10k_htc_tx_complete_work);
-
 	return 0;
 }
 
@@ -1294,6 +1291,10 @@ int ath10k_htc_init(struct ath10k *ar)
 	struct ath10k_htc *htc = &ar->htc;
 	struct ath10k_htc_svc_conn_req conn_req;
 	struct ath10k_htc_svc_conn_resp conn_resp;
+
+	/* Error cleanup also cancels these works when HTC READY times out. */
+	INIT_WORK(&ar->bundle_tx_work, ath10k_htc_bundle_tx_work);
+	INIT_WORK(&ar->tx_complete_work, ath10k_htc_tx_complete_work);
 
 	spin_lock_init(&htc->tx_lock);
 

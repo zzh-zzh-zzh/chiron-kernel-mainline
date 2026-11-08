@@ -591,6 +591,8 @@ struct ath10k_vif {
 	struct ieee80211_vif *vif;
 
 	bool is_started;
+	bool chiron_disassoc_stopped;
+	bool chiron_disassoc_failed;
 	bool is_up;
 	bool spectral_enabled;
 	bool ps;
