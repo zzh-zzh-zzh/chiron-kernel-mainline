@@ -389,6 +389,7 @@ static void free_idle_time(struct cpufreq_cooling_device *cpufreq_cdev)
 static unsigned int get_state_freq(struct cpufreq_cooling_device *cpufreq_cdev,
 				   unsigned long state)
 {
+	struct cpufreq_frequency_table *pos;
 	struct cpufreq_policy *policy;
 	unsigned long idx;
 
@@ -416,7 +417,16 @@ static unsigned int get_state_freq(struct cpufreq_cooling_device *cpufreq_cdev,
 	else
 		idx = state;
 
-	return policy->freq_table[idx].frequency;
+	/* Cooling levels count valid entries, not hardware LUT indices. */
+	cpufreq_for_each_valid_entry(pos, policy->freq_table) {
+		if (!idx)
+			return pos->frequency;
+		idx--;
+	}
+
+	/* max_level and the validated state must resolve to a valid entry. */
+	WARN_ON_ONCE(1);
+	return 0;
 }
 
 /* cpufreq cooling device callback functions are defined below */
@@ -628,6 +638,29 @@ cpufreq_cooling_register(struct cpufreq_policy *policy)
 }
 EXPORT_SYMBOL_GPL(cpufreq_cooling_register);
 
+/* A failed init or CPU hotplug can change the policy's representative CPU. */
+static struct device_node *of_cpufreq_cooling_node(struct cpufreq_policy *policy)
+{
+	struct device_node *np;
+	unsigned int cpu;
+
+	np = of_get_cpu_node(policy->cpu, NULL);
+	if (np && of_property_present(np, "#cooling-cells"))
+		return np;
+	of_node_put(np);
+
+	for_each_cpu(cpu, policy->related_cpus) {
+		if (cpu == policy->cpu)
+			continue;
+		np = of_get_cpu_node(cpu, NULL);
+		if (np && of_property_present(np, "#cooling-cells"))
+			return np;
+		of_node_put(np);
+	}
+
+	return NULL;
+}
+
 /**
  * of_cpufreq_cooling_register - function to create cpufreq cooling device.
  * @policy: cpufreq policy
@@ -647,24 +680,19 @@ EXPORT_SYMBOL_GPL(cpufreq_cooling_register);
 struct thermal_cooling_device *
 of_cpufreq_cooling_register(struct cpufreq_policy *policy)
 {
-	struct device_node *np = of_get_cpu_node(policy->cpu, NULL);
-	struct thermal_cooling_device *cdev = NULL;
+	struct device_node *np = of_cpufreq_cooling_node(policy);
+	struct thermal_cooling_device *cdev;
+	struct em_perf_domain *em;
 
-	if (!np) {
-		pr_err("cpufreq_cooling: OF node not available for cpu%d\n",
-		       policy->cpu);
+	if (!np)
 		return NULL;
-	}
 
-	if (of_property_present(np, "#cooling-cells")) {
-		struct em_perf_domain *em = em_cpu_get(policy->cpu);
-
-		cdev = __cpufreq_cooling_register(np, policy, em);
-		if (IS_ERR(cdev)) {
-			pr_err("cpufreq_cooling: cpu%d failed to register as cooling device: %ld\n",
-			       policy->cpu, PTR_ERR(cdev));
-			cdev = NULL;
-		}
+	em = em_cpu_get(policy->cpu);
+	cdev = __cpufreq_cooling_register(np, policy, em);
+	if (IS_ERR(cdev)) {
+		pr_err("cpufreq_cooling: cpu%d failed to register as cooling device: %ld\n",
+		       policy->cpu, PTR_ERR(cdev));
+		cdev = NULL;
 	}
 
 	of_node_put(np);
