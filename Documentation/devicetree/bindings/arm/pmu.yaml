@@ -80,6 +80,7 @@ properties:
           - nvidia,denver-pmu
           - nvidia,carmel-pmu
           - qcom,krait-pmu
+          - qcom,kryo280-pmu
           - qcom,scorpion-pmu
           - qcom,scorpion-mp-pmu
           - samsung,mongoose-pmu

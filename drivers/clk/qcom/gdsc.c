@@ -269,7 +269,7 @@ static inline void gdsc_assert_clamp_io(struct gdsc *sc)
 static inline void gdsc_assert_reset_aon(struct gdsc *sc)
 {
 	regmap_update_bits(sc->regmap, sc->clamp_io_ctrl,
-			   GMEM_RESET_MASK, 1);
+			   GMEM_RESET_MASK, GMEM_RESET_MASK);
 	udelay(1);
 	regmap_update_bits(sc->regmap, sc->clamp_io_ctrl,
 			   GMEM_RESET_MASK, 0);

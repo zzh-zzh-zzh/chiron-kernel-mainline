@@ -1525,6 +1525,7 @@ PMUV3_INIT_MAP_EVENT(armv8_brcm_vulcan, armv8_vulcan_map_event)
 
 static const struct of_device_id armv8_pmu_of_device_ids[] = {
 	{.compatible = "arm,armv8-pmuv3",	.data = armv8_pmuv3_pmu_init},
+	{.compatible = "qcom,kryo280-pmu",	.data = armv8_pmuv3_pmu_init},
 	{.compatible = "arm,c1-nano-pmu",	.data = armv8_c1_nano_pmu_init},
 	{.compatible = "arm,c1-premium-pmu",	.data = armv8_c1_premium_pmu_init},
 	{.compatible = "arm,c1-pro-pmu",	.data = armv8_c1_pro_pmu_init},

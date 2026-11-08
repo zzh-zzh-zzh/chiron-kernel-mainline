@@ -4,6 +4,7 @@
  * Copyright (c) 2011 Unixphere
  */
 
+#include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/rmi.h>
 #include <linux/of.h>
@@ -25,6 +26,7 @@
  * @tx_buf: Buffer used for transmitting data to the sensor over i2c.
  * @tx_buf_size: Size of the buffer
  *
+ * @reset_gpio: Optional active-low hardware reset
  * @supplies: Array of voltage regulators
  * @startup_delay: Milliseconds to pause after powering up the regulators
  */
@@ -38,6 +40,7 @@ struct rmi_i2c_xport {
 	u8 *tx_buf;
 	size_t tx_buf_size;
 
+	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data supplies[2];
 	u32 startup_delay;
 };
@@ -191,6 +194,13 @@ static void rmi_i2c_regulator_bulk_disable(void *data)
 			       rmi_i2c->supplies);
 }
 
+static void rmi_i2c_assert_reset(void *data)
+{
+	struct rmi_i2c_xport *rmi_i2c = data;
+
+	gpiod_set_value_cansleep(rmi_i2c->reset_gpio, 1);
+}
+
 static void rmi_i2c_unregister_transport(void *data)
 {
 	struct rmi_i2c_xport *rmi_i2c = data;
@@ -204,6 +214,7 @@ static int rmi_i2c_probe(struct i2c_client *client)
 	struct rmi_device_platform_data *client_pdata =
 					dev_get_platdata(&client->dev);
 	struct rmi_i2c_xport *rmi_i2c;
+	u32 reset_delay = 20;
 	int error;
 
 	rmi_i2c = devm_kzalloc(&client->dev, sizeof(struct rmi_i2c_xport),
@@ -226,6 +237,13 @@ static int rmi_i2c_probe(struct i2c_client *client)
 			"adapter does not support required functionality\n");
 		return -ENODEV;
 	}
+
+	/* Hold reset asserted while enabling the sensor's supplies. */
+	rmi_i2c->reset_gpio = devm_gpiod_get_optional(&client->dev, "reset",
+						    GPIOD_OUT_HIGH);
+	if (IS_ERR(rmi_i2c->reset_gpio))
+		return dev_err_probe(&client->dev, PTR_ERR(rmi_i2c->reset_gpio),
+				     "Failed to get reset GPIO\n");
 
 	rmi_i2c->supplies[0].supply = "vdd";
 	rmi_i2c->supplies[1].supply = "vio";
@@ -250,6 +268,21 @@ static int rmi_i2c_probe(struct i2c_client *client)
 			     &rmi_i2c->startup_delay);
 
 	msleep(rmi_i2c->startup_delay);
+
+	if (rmi_i2c->reset_gpio) {
+		/* Assert reset before supplies are disabled on probe failure/remove. */
+		error = devm_add_action_or_reset(&client->dev,
+						  rmi_i2c_assert_reset, rmi_i2c);
+		if (error)
+			return error;
+
+		/* Chiron stock requires at least 5 ms low and 200 ms after release. */
+		usleep_range(5000, 6000);
+		gpiod_set_value_cansleep(rmi_i2c->reset_gpio, 0);
+		of_property_read_u32(client->dev.of_node, "syna,reset-delay-ms",
+				     &reset_delay);
+		msleep(reset_delay);
+	}
 
 	rmi_i2c->client = client;
 	mutex_init(&rmi_i2c->page_mutex);

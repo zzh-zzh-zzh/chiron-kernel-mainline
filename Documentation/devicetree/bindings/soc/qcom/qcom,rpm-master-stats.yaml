@@ -34,7 +34,7 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     description: Phandle to an RPM MSG RAM slice containing the master stats
     minItems: 1
-    maxItems: 5
+    maxItems: 6
     items:
       maxItems: 1
 
@@ -44,7 +44,7 @@ properties:
       The name of the RPM Master which owns the MSG RAM slice where this
       instance of Master Stats resides
     minItems: 1
-    maxItems: 5
+    maxItems: 6
 
 required:
   - compatible
