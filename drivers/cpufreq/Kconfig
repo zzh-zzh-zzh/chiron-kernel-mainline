@@ -367,3 +367,12 @@ config ACPI_CPPC_CPUFREQ_FIE
 endif # CPU_FREQ
 
 endmenu
+
+config CHIRON_CPUFREQ_OSM
+	bool "Chiron MSM8998 OSM and CPRh CPU DVFS"
+	depends on ARCH_QCOM && CPU_FREQ && PM && PM_GENERIC_DOMAINS_OF && NVMEM
+	depends on COMMON_CLK && QCOM_SCM && MFD_SYSCON
+	select PM_OPP
+	help
+	  MSM8998 CPU OSM initialization with efuse-derived CPRh
+	  voltage corners. Does not replace the upstream Qualcomm drivers.
